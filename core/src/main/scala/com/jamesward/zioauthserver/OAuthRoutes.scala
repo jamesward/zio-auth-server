@@ -274,7 +274,9 @@ final class OAuthRoutes[R, U: Tag](cfg: AuthServerConfig, gate: AuthorizeGate[R,
   /** The consent page: not framable, not cached, and with the session's csrf token in its form. */
   private def consentPage(user: U, client: OAuthClient, ru: RedirectUri, scopes: Set[OAuthScope], q: QueryParams, req: Request): Response =
     Sessions.readCookie(req, cfg.cookies.csrfName) match
-      case None       => redirectToLogin(req)
+      // Not a login bounce: `/login` would resume the session and send the browser straight back here, forever.
+      case None       =>
+        Response.text("Your sign-in is missing its CSRF cookie. Sign out, sign in again, and retry.").status(Status.Forbidden)
       case Some(csrf) =>
         val host = scala.util.Try(java.net.URI.create(ru.value)).toOption.flatMap(u => Option(u.getHost)).getOrElse(ru.value)
         Response

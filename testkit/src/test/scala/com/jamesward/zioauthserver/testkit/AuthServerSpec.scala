@@ -255,6 +255,13 @@ object AuthServerSpec extends ZIOSpecDefault:
         location(denied).exists(_.queryParams.queryParam("code").isEmpty),
       )
     },
+    test("a session without its csrf cookie gets an error, not a login bounce that would loop") {
+      for
+        cookies <- freshEmail.flatMap(signIn)
+        _       <- registerClient()
+        resp    <- run(withCookies(Request.get(url("/oauth/authorize").addQueryParams(authorizeQuery())), cookies - DevConfig.cookies.csrfName))
+      yield assertTrue(resp.status == (Status.Forbidden: Status), location(resp).isEmpty)
+    },
     test("a client in skipConsent gets the code at once") {
       for
         cookies <- freshEmail.flatMap(signIn)
