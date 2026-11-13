@@ -10,6 +10,8 @@ libraryDependencies ++= Seq(
   "dev.zio"     %% "zio-schema"            % zioSchemaVersion,
   "dev.zio"     %% "zio-schema-derivation" % zioSchemaVersion,
   "com.nimbusds" % "nimbus-jose-jwt"       % "10.10",
+  // Passkeys: WebAuthn registration and assertion verification.
+  "com.yubico"   % "webauthn-server-core"  % "2.10.1",
 
   "dev.zio" %% "zio-test"     % zioVersion % Test,
   "dev.zio" %% "zio-test-sbt" % zioVersion % Test,

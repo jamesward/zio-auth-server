@@ -7,14 +7,30 @@ toolbook's `login` module. See `README.md` for the feature overview. Releases go
 
 ## Modules
 
-- `core` (artifact `zio-auth-server`): the server. Package `com.jamesward.zioauthserver`. Persistence is the
-  `AuthStore[U]` port, generic over the app's user type through `AccountView[U]`; email goes through `Mailer`.
+- `core` (artifact `zio-auth-server`): the server. Package `com.jamesward.zioauthserver`.
+  - Persistence is the store traits, generic over the app's user type through `AccountView[U]`: `AuthStore[U]` (the
+    sign-in and OAuth data toolbook's API layer implements), and the optional `AccountStore[U]`, `PasskeyStore`,
+    `ConnectionStore`. New store needs go in new traits, or `AuthStore` methods with a default, so toolbook's
+    `ApiAuthStore` keeps compiling.
+  - Opt-in route sets beside `LoginRoutes` and `OAuthRoutes`: `PasskeyRoutes`, `AccountRoutes` (email change),
+    `ConnectionRoutes` (an `OAuthConnector`'s callback). Identity changes require `StepUp`.
+  - Passkeys use Yubico's `webauthn-server-core`. Its `CredentialRepository` is synchronous, so each ceremony loads
+    what it needs from the store first and passes a snapshot.
+- `magnum` (artifact `zio-auth-server-magnum`): `MagnumAuthStore` (every store trait on Postgres, user type `AuthUser`)
+  and `AuthSchema` (its own Flyway run: migrations at `classpath:com/jamesward/zioauthserver/magnum/migrations`,
+  schema and history table `auth`). Add migrations as new `V<n>__*.sql` files there; never edit a released one. Plain
+  magnum in `ZIO.attemptBlocking`, not zio-magnum (whose connection `FiberRef` is closed by the SLF4J bridge, see
+  toolbook's AGENTS.md). Business failures are returned as `Either` from the transaction, so work before them (a
+  counted OTP attempt, a revoked replay chain) commits.
 - `testkit` (artifact `zio-auth-server-test`): development and test helpers, package
   `com.jamesward.zioauthserver.testkit`. Apps depend on it in the Test scope only, so anything that would be unsafe in
-  production belongs here and not in `core`: `InMemoryAuthStore`, `RecordingMailer`, `DevConfig` (plain cookies, fixed
-  pepper), `DevSessions.fixed`, `DevJwtSigner`. `core` keeps such code `private[zioauthserver]` (for example
-  `Sessions.fixed`) and `testkit` exposes it. The end-to-end `AuthServerSpec` lives in `testkit`'s tests, since `core`
-  can't depend on `testkit`.
+  production belongs here and not in `core`: `InMemoryAuthStore`, `AuthStoreContract`, `SoftwareAuthenticator`,
+  `RecordingMailer`, `DevConfig` (plain cookies, fixed pepper), `DevSessions.fixed`, `DevJwtSigner`. `core` keeps such
+  code `private[zioauthserver]` (for example `Sessions.fixed`) and `testkit` exposes it. `zio-test` is a compile
+  dependency here (the contract suite is a Spec). The route specs live in `testkit`'s tests, since `core` can't depend
+  on `testkit`.
+- Every store implementation runs `AuthStoreContract`: `InMemoryAuthStoreSpec`, `MagnumAuthStoreSpec` (Testcontainers
+  Postgres). A behavior every store must have goes into the contract, not into one store's spec.
 
 ## Skills
 
@@ -31,7 +47,8 @@ toolbook's `login` module. See `README.md` for the feature overview. Releases go
   deferred in Claude Code: load them with ToolSearch (search `sbta`). If it's unavailable, say so and use
   `./sbta <command>`.
 - Commands (CLI fallback form): `./sbta "Test / compile"`, `./sbta testFull` (what CI runs).
-- Tests need no network beyond dependency resolution, no Docker, and nothing paid or metered.
+- Tests need Docker for `magnum`'s Postgres (Testcontainers, Ryuk disabled; the specs stop their container), no network
+  beyond dependency resolution and the image pull, and nothing paid or metered.
 - Working on toolbook (or another app) against this checkout: the app's build uses a local `ProjectRef` to
   `../zio-auth-server` behind a flag (see that app's AGENTS.md). Run `./sbta publishLocal` only when a flag-free
   build needs it.

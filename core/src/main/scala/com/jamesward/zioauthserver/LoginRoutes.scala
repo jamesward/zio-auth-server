@@ -61,6 +61,8 @@ final class LoginRoutes[U: Tag](cfg: AuthServerConfig, pages: Pages[U], messages
     val rt = q.queryParam("return_to").flatMap(cfg.safeReturnTo)
     if q.hasQueryParam("sent") then ZIO.succeed(htmlResponse(pages.magicLinkSent))
     else if q.hasQueryParam("invalid") then ZIO.succeed(htmlResponse(pages.invalidLink))
+    // Step-up: sign in again even with a live session (see StepUp).
+    else if q.hasQueryParam("reauth") then ZIO.succeed(htmlResponse(pages.login(None, rt)))
     else
       val effect =
         for
@@ -91,6 +93,15 @@ final class LoginRoutes[U: Tag](cfg: AuthServerConfig, pages: Pages[U], messages
     }
 
   private def mintAndSend(email: Email, returnTo: Option[String]): RIO[Env, Unit] =
+    whenMayStart(email)(sendLink(email, returnTo))
+
+  private def whenMayStart(email: Email)(send: RIO[Env, Unit]): RIO[Env, Unit] =
+    store.flatMap(_.mayStartSignIn(email)).mapError(Sessions.asThrowable).flatMap {
+      case true  => send
+      case false => ZIO.logInfo("sign-in not started: the address may not sign in")
+    }
+
+  private def sendLink(email: Email, returnTo: Option[String]): RIO[Env, Unit] =
     for
       now    <- Clock.instant
       minted <- MagicTokenOps.mint(cfg)
@@ -136,6 +147,9 @@ final class LoginRoutes[U: Tag](cfg: AuthServerConfig, pages: Pages[U], messages
     }
 
   private def mintAndSendCode(email: Email): RIO[Env, Unit] =
+    whenMayStart(email)(sendCode(email))
+
+  private def sendCode(email: Email): RIO[Env, Unit] =
     for
       now    <- Clock.instant
       minted <- OtpOps.mint(cfg, email)

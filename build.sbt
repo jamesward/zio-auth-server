@@ -43,8 +43,11 @@ lazy val core = project in file("core")
 // sessions and throwaway signing keys. Depend on it in the Test scope only, so none of it can reach production.
 lazy val testkit = (project in file("testkit")).dependsOn(core)
 
+// Postgres stores with magnum, and the `auth` schema's migrations (artifact zio-auth-server-magnum).
+lazy val magnum = (project in file("magnum")).dependsOn(core, testkit % Test)
+
 lazy val root = (project in file("."))
-  .aggregate(core, testkit)
+  .aggregate(core, testkit, magnum)
   .settings(
     name := "zio-auth-server-root",
     publish / skip := true,

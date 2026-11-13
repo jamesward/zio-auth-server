@@ -52,11 +52,11 @@ object AuthServerSpec extends ZIOSpecDefault:
   final case class TokenBody(access_token: String, refresh_token: Option[String]) derives JsonDecoder
   final case class TokenError(error: String) derives JsonDecoder
 
-  private type Env = AuthStore[TestUser] & InMemoryAuthStore[TestUser] & Mailer & RecordingMailer & SecureRandomGen &
+  private type Env = InMemoryAuthStore.Stores[TestUser] & InMemoryAuthStore[TestUser] & Mailer & RecordingMailer & SecureRandomGen &
     JwtSigner & Client
 
   private val env: ZLayer[Any, Throwable, Env] =
-    InMemoryAuthStore.layer[TestUser]((id, email, _) => TestUser(id, email)) ++ RecordingMailer.layer ++
+    InMemoryAuthStore.layer[TestUser]((id, email, _) => TestUser(id, email), (u, e) => u.copy(email = e)) ++ RecordingMailer.layer ++
       SecureRandomGen.live ++ DevJwtSigner.fresh ++ Client.default
 
   private def run(req: Request): ZIO[Env & Scope, Nothing, Response] = routes.runZIO(req)

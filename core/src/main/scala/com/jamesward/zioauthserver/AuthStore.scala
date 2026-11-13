@@ -13,6 +13,13 @@ import java.time.Instant
  * and the [[AuthorizeGate]] see the application's own user, and [[AccountView]] says what the server needs from it.
  */
 trait AuthStore[U]:
+  /**
+   * Whether a sign-in link or code may be sent to `email`. A store with a closed [[SignUpPolicy]] answers `false` for
+   * unknown addresses, so the server doesn't mail strangers. The page says "check your inbox" either way, so this
+   * doesn't reveal who has an account.
+   */
+  def mayStartSignIn(email: Email): IO[StoreError, Boolean] = ZIO.succeed(true)
+
   // Email sign-in and browser sessions
   def createChallenge(challenge: EmailLoginChallenge): IO[StoreError, Unit]
   def verifyAndStartSession(request: VerifyAndStartSessionRequest): IO[VerifyError, U]

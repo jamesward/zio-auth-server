@@ -114,6 +114,19 @@ trait Messages:
   def magicLink(to: Email, link: String, now: Instant, expiresAt: Instant): EmailMessage
   def otpCode(to: Email, code: OtpCode, now: Instant, expiresAt: Instant): EmailMessage
 
+  /** Sent to the NEW address when a user changes theirs. */
+  def emailChange(to: Email, link: String, now: Instant, expiresAt: Instant): EmailMessage =
+    EmailMessage(
+      to,
+      "Confirm your new email address",
+      s"""Click the link below to make this your sign-in address. It ${EmailTime.describeExpiration(now, expiresAt)}.
+         |
+         |$link
+         |
+         |If you did not ask for this, you can safely ignore the email; nothing changes.
+         |""".stripMargin,
+    )
+
 object Messages:
 
   /** The default emails, naming `product` in the subject. */
