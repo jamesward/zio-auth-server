@@ -102,9 +102,10 @@ val stores = MagnumAuthStore.layer(SignUpPolicy.ExistingUsersOnly) // AuthStore,
 - Don't add the library's location to the app's Flyway `locations`: both would share one history, and a library `V2`
   would clash with the app's `V2`.
 
-Each store call is one JDBC transaction on a blocking thread; single-use rows are locked (`select … for update`) or
-removed (`delete … returning`) in it. The store uses plain magnum, not zio-magnum, so no connection lives in a
-`FiberRef`.
+The store uses [zio-magnum](https://github.com/cheleb/zio-magnum). Single-use rows are locked (`select … for update`) or
+removed (`delete … returning`) inside one `transaction`. If your app installs the zio-logging SLF4J bridge, install it
+with `Slf4jBridge.initWithoutFiberRefPropagation`: with `init`, an SLF4J log inside a zio-magnum transaction closes the
+transaction's connection.
 
 ## Tests and local development
 

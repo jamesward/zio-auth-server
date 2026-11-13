@@ -18,10 +18,12 @@ toolbook's `login` module. See `README.md` for the feature overview. Releases go
     what it needs from the store first and passes a snapshot.
 - `magnum` (artifact `zio-auth-server-magnum`): `MagnumAuthStore` (every store trait on Postgres, user type `AuthUser`)
   and `AuthSchema` (its own Flyway run: migrations at `classpath:com/jamesward/zioauthserver/magnum/migrations`,
-  schema and history table `auth`). Add migrations as new `V<n>__*.sql` files there; never edit a released one. Plain
-  magnum in `ZIO.attemptBlocking`, not zio-magnum (whose connection `FiberRef` is closed by the SLF4J bridge, see
-  toolbook's AGENTS.md). Business failures are returned as `Either` from the transaction, so work before them (a
-  counted OTP attempt, a revoked replay chain) commits.
+  schema and history table `auth`). Add migrations as new `V<n>__*.sql` files there; never edit a released one. Always
+  zio-magnum (`transaction`, `zQuery`, `zUpdate`), not plain magnum. Its connection `FiberRef` is closed by the
+  zio-logging SLF4J bridge's `init`; apps use `Slf4jBridge.initWithoutFiberRefPropagation` (see toolbook's AGENTS.md).
+  Business failures are returned as `Either` from the transaction, so work before them (a counted OTP attempt, a revoked
+  replay chain) commits. Store calls `resurrect` before mapping errors: `zUpdate` runs `executeUpdate()` in a `map`, so
+  its SQL errors (a unique violation) arrive as defects.
 - `testkit` (artifact `zio-auth-server-test`): development and test helpers, package
   `com.jamesward.zioauthserver.testkit`. Apps depend on it in the Test scope only, so anything that would be unsafe in
   production belongs here and not in `core`: `InMemoryAuthStore`, `AuthStoreContract`, `SoftwareAuthenticator`,

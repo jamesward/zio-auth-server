@@ -4,8 +4,7 @@ val zioVersion    = "2.1.27"
 val flywayVersion = "13.12.2"
 
 libraryDependencies ++= Seq(
-  // Plain magnum (not zio-magnum): each store call is one blocking JDBC transaction, so nothing is kept in a FiberRef.
-  "com.augustnagro" %% "magnum"                     % "2.0.0",
+  "dev.cheleb"       %% "zio-magnum"                 % "4.2.0",
   "org.flywaydb"     % "flyway-core"                % flywayVersion,
   "org.flywaydb"     % "flyway-database-postgresql" % flywayVersion,
 
