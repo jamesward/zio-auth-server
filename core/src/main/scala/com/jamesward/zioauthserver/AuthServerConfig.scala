@@ -70,6 +70,25 @@ final case class AuthServerConfig(
      * to `/oauth/authorize` would hand the attacker's client a code for the user. Default: every client asks.
      */
     skipConsent:          OAuthClient => Boolean = _ => false,
+    /**
+     * At most `otpCodesPerWindow` one-time codes are sent to one address per `otpWindow`. Each code allows
+     * [[EmailOtpChallenge.maxAttempts]] guesses, so without a limit an attacker could keep asking for codes and keep
+     * guessing. Over the limit, no code is sent and the newest one stays valid; the page doesn't say so, so it doesn't
+     * reveal which addresses have accounts.
+     */
+    otpCodesPerWindow:    Int      = 5,
+    otpWindow:            Duration = 1.hour,
+    /**
+     * Clients that may introspect any token (a resource server you registered). Every other client gets `active` only
+     * for its own tokens: anyone can register a client, so introspection must not tell them about others' tokens.
+     */
+    introspectAnyToken:   OAuthClient => Boolean = _ => false,
+    /**
+     * Fetch Client ID Metadata Documents from `http://localhost` and other loopback addresses, for local development
+     * and tests. Off in production: a CIMD `client_id` is a URL the server fetches, so it must not reach the server's
+     * own or its network's private addresses ([[CimdAddressPolicy]]).
+     */
+    cimdAllowLoopback:    Boolean = false,
 ):
   /** The issuer: the base URL without a trailing slash. */
   val issuer: String = baseUrl.encode.stripSuffix("/")

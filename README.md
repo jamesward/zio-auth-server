@@ -6,7 +6,7 @@ A Scala 3 / [ZIO](https://zio.dev) / [zio-http](https://zio.dev/zio-http) OAuth 
 first-party email sign-in, for apps whose MCP servers and web pages need signed-in users.
 
 - **Email sign-in**: a magic link, or a six-digit code typed back (for a link opened on another device). Codes allow
-  five attempts.
+  five attempts, and an address gets at most five codes an hour (`AuthServerConfig.otpCodesPerWindow`).
 - **Browser sessions**: a revocable session cookie, a CSRF cookie, and a short-lived RS256 access-JWT cookie that
   other first-party servers can verify against `/oauth/jwks` without a database lookup. `/login?return_to=` resumes a
   live session without email.
@@ -15,7 +15,14 @@ first-party email sign-in, for apps whose MCP servers and web pages need signed-
   introspection and revocation, and `/.well-known/oauth-authorization-server`.
 - **Consent and scopes**: a signed-in user approves each client on a consent page (`Pages.consent`) before it gets a
   code, except clients you list in `AuthServerConfig.skipConsent`. A token carries the user's own scopes plus only the
-  requested scopes in `AuthServerConfig.clientScopes`, so a client can't ask its way to a role.
+  requested scopes in `AuthServerConfig.clientScopes`, so a client can't ask its way to a role. A refresh reads the
+  user again (`AuthStore.findActiveUser`): the new token has the user's current scopes, and a deleted or disabled
+  user's refresh fails and revokes the chain.
+- **Introspection for the token's own client**: a client learns only about tokens issued to it, except clients you
+  list in `AuthServerConfig.introspectAnyToken` (a resource server you registered).
+- **Client ID Metadata Documents fetched safely**: only over HTTPS and only from public addresses, never the
+  server's own or its network's private ones (`CimdAddressPolicy`). `cimdAllowLoopback` allows `localhost` for
+  development; `DevConfig` turns it on.
 - **Your user type, your storage**: the server is generic over the app's user type (`AccountView[U]` says what it
   needs from it) and persists through the `AuthStore[U]` port, so an app can keep the data in its own database or
   behind its own API. Only hashes of secrets (HMAC with a pepper) are stored.
@@ -43,13 +50,15 @@ first-party email sign-in, for apps whose MCP servers and web pages need signed-
 
 ## Install
 
+[![Maven Central](https://img.shields.io/maven-central/v/com.jamesward/zio-auth-server_3)](https://central.sonatype.com/artifact/com.jamesward/zio-auth-server_3)
+
 ```scala
 libraryDependencies ++= Seq(
-  "com.jamesward" %% "zio-auth-server"      % "<version>",
+  "com.jamesward" %% "zio-auth-server"      % "0.0.2",
   // Postgres stores, if you don't bring your own.
-  "com.jamesward" %% "zio-auth-server-magnum" % "<version>",
+  "com.jamesward" %% "zio-auth-server-magnum" % "0.0.2",
   // In-memory stores, the contract suite, dev helpers. Test scope only.
-  "com.jamesward" %% "zio-auth-server-test" % "<version>" % Test,
+  "com.jamesward" %% "zio-auth-server-test" % "0.0.2" % Test,
 )
 ```
 

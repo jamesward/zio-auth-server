@@ -11,7 +11,9 @@ toolbook's `login` module. See `README.md` for the feature overview. Releases go
   - Persistence is the store traits, generic over the app's user type through `AccountView[U]`: `AuthStore[U]` (the
     sign-in and OAuth data toolbook's API layer implements), and the optional `AccountStore[U]`, `PasskeyStore`,
     `ConnectionStore`. New store needs go in new traits, or `AuthStore` methods with a default, so toolbook's
-    `ApiAuthStore` keeps compiling.
+    `ApiAuthStore` keeps compiling. When there is no safe default (`findActiveUser` and `countOtpChallengesSince` in
+    0.0.2: a default would skip the check), add the method and update toolbook's `ApiAuthStore` and api with the
+    release.
   - Opt-in route sets beside `LoginRoutes` and `OAuthRoutes`: `PasskeyRoutes`, `AccountRoutes` (email change),
     `ConnectionRoutes` (an `OAuthConnector`'s callback). Identity changes require `StepUp`.
   - Passkeys use Yubico's `webauthn-server-core`. Its `CredentialRepository` is synchronous, so each ceremony loads

@@ -11,7 +11,8 @@ import java.time.Instant
  * The behavior every store implementation must have, one suite per store interface, so a store that implements only
  * some of them (toolbook's API-backed `AuthStore`) runs the suites it can:
  *
- *   - [[authStore]]: single-use links and codes (five wrong codes lock one), sessions, single-use grants (also under 20
+ *   - [[authStore]]: single-use links and codes (five wrong codes lock one), counting codes per address, sessions,
+ *     active users, single-use grants (also under 20
  *     concurrent exchanges), revocation only by the owning client, refresh-token rotation once (also under 10 concurrent
  *     rotations) with a replay revoking the whole chain. Needs a store that signs up new addresses (the contract uses
  *     random `@example.com` ones), as [[SignUpPolicy.Open]] does.
@@ -155,6 +156,33 @@ object AuthStoreContract:
               _       <- store(_.deleteSession(sh))
               gone    <- store(_.findSession(sh))
             yield assertTrue(found.map(p => view.id(p._2)) == Some(view.id(u)), gone.isEmpty)
+          )
+        },
+        test("one-time codes are counted per address, from a time on") {
+          open(
+            for
+              email  <- freshEmail
+              other  <- freshEmail
+              now    <- Clock.instant
+              hash    = OtpCodeHash.hash(email, OtpCode.parse("111111").toOption.get, pepper)
+              code    = (issued: Instant) =>
+                          EmailOtpChallenge(EmailOtpChallengeId.fresh(java.util.UUID.randomUUID()), email, hash, issued, issued.plusSeconds(600), None, 0)
+              _      <- store(_.createOtpChallenge(code(now.minusSeconds(7200))))
+              _      <- store(_.createOtpChallenge(code(now.minusSeconds(60))))
+              _      <- store(_.createOtpChallenge(code(now)))
+              recent <- store(_.countOtpChallengesSince(email, now.minusSeconds(3600)))
+              all    <- store(_.countOtpChallengesSince(email, now.minusSeconds(86400)))
+              none   <- store(_.countOtpChallengesSince(other, now.minusSeconds(86400)))
+            yield assertTrue(recent == 2, all == 3, none == 0)
+          )
+        },
+        test("a signed-up user is an active user; an unknown id is not") {
+          open(
+            for
+              user    <- freshEmail.flatMap(signIn)
+              found   <- store(_.findActiveUser(view.id(user)))
+              unknown <- store(_.findActiveUser(UserId.fresh(java.util.UUID.randomUUID())))
+            yield assertTrue(found.map(view.id) == Some(view.id(user)), unknown.isEmpty)
           )
         },
       ),

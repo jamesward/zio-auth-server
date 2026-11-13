@@ -102,6 +102,8 @@ final class MagnumAuthStore(dataSource: DataSource, schema: String, signUp: Sign
 
   def findUser(id: UserId): IO[StoreError, Option[AuthUser]] = run(userById(id.value))
 
+  def findActiveUser(id: UserId): IO[StoreError, Option[AuthUser]] = run(activeUser(id.value))
+
   // ── email sign-in and sessions ───────────────────────────────────────────
 
   def createChallenge(c: EmailLoginChallenge): IO[StoreError, Unit] =
@@ -132,6 +134,9 @@ final class MagnumAuthStore(dataSource: DataSource, schema: String, signUp: Sign
   def createOtpChallenge(c: EmailOtpChallenge): IO[StoreError, Unit] =
     run(sql"""insert into $otpChallenges (id, email, code_hash, issued_at, expires_at, consumed_at, attempts)
               values (${c.id.value}, ${c.email.value}, ${c.codeHash.bytes}, ${c.issuedAt}, ${c.expiresAt}, ${c.consumedAt}, ${c.attempts})""".zUpdate.unit)
+
+  def countOtpChallengesSince(email: Email, since: Instant): IO[StoreError, Int] =
+    run(sql"select count(*) from $otpChallenges where email = ${email.value} and issued_at >= $since".zQuery[Long].map(_.headOption.fold(0)(_.toInt)))
 
   def verifyOtpAndStartSession(r: VerifyOtpAndStartSessionRequest): IO[VerifyOtpError, AuthUser] =
     Clock.instant.flatMap { now =>

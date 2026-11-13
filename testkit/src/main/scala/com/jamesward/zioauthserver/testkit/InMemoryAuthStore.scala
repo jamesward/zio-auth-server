@@ -52,6 +52,9 @@ final class InMemoryAuthStore[U] private (
   def createOtpChallenge(challenge: EmailOtpChallenge): IO[StoreError, Unit] =
     state.update(s => s.copy(otpChallenges = s.otpChallenges.updated(challenge.id, challenge)))
 
+  def countOtpChallengesSince(email: Email, since: Instant): IO[StoreError, Int] =
+    state.get.map(_.otpChallenges.values.count(c => c.email == email && !c.issuedAt.isBefore(since)))
+
   def verifyOtpAndStartSession(request: VerifyOtpAndStartSessionRequest): IO[VerifyOtpError, U] =
     for
       now  <- Clock.instant
@@ -80,6 +83,9 @@ final class InMemoryAuthStore[U] private (
 
   def deleteSession(idHash: SessionIdHash): IO[StoreError, Unit] =
     state.update(s => s.copy(sessions = s.sessions - key(idHash.bytes)))
+
+  // Every user here is active; `removeUser` takes one away.
+  def findActiveUser(id: UserId): IO[StoreError, Option[U]] = state.get.map(_.usersById.get(id))
 
   // OAuth clients, codes and tokens
 
@@ -276,6 +282,12 @@ final class InMemoryAuthStore[U] private (
   /** Adds a session row directly, for a dev login with a fixed session ([[DevSessions.fixed]]). */
   def putSession(session: Session): UIO[Unit] =
     state.update(s => s.copy(sessions = s.sessions.updated(key(session.idHash.bytes), session)))
+
+  /** Removes a user, as a deleted or disabled one: their sessions and tokens stop finding them. */
+  def removeUser(id: UserId): UIO[Unit] =
+    state.update(s =>
+      s.copy(usersById = s.usersById - id, usersByEmail = s.usersByEmail.filterNot((_, uid) => uid == id))
+    )
 
 object InMemoryAuthStore:
 

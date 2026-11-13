@@ -12,12 +12,12 @@ import java.time.Instant
 /** The whole server, end to end, over the in-memory store. */
 object AuthServerSpec extends ZIOSpecDefault:
 
-  final case class TestUser(id: UserId, email: Email)
+  final case class TestUser(id: UserId, email: Email, scopes: Set[OAuthScope] = Set(OAuthScope.of("role:user")))
 
   given AccountView[TestUser] with
     def id(user: TestUser): UserId               = user.id
     def email(user: TestUser): Email             = user.email
-    def scopes(user: TestUser): Set[OAuthScope] = Set(OAuthScope.of("role:user"))
+    def scopes(user: TestUser): Set[OAuthScope] = user.scopes
 
   private val baseUrl = URL.decode("http://localhost:9000").toOption.get
 
@@ -168,6 +168,29 @@ object AuthServerSpec extends ZIOSpecDefault:
   private def json[A: JsonDecoder](resp: Response): Task[A] =
     resp.body.asString.flatMap(s => ZIO.fromEither(s.fromJson[A]).mapError(e => new AssertionError(s"$e: $s")))
 
+  final case class Introspection(active: Boolean) derives JsonDecoder
+
+  private def introspect(token: String, cid: ClientId): ZIO[Env & Scope, Throwable, Boolean] =
+    run(Request.post(url("/oauth/introspect"), form("token" -> token, "client_id" -> cid.value)))
+      .flatMap(json[Introspection])
+      .map(_.active)
+
+  private def user(email: Email): ZIO[Env, AssertionError, TestUser] =
+    ZIO.serviceWithZIO[InMemoryAuthStore[TestUser]](_.users).map(_.find(_.email == email)).someOrFail(new AssertionError("no user"))
+
+  private def scopesOf(tokens: TokenBody): Set[OAuthScope] = OAuthScopeSet.parse(tokens.scope)
+
+  private def refreshTokenRow(token: String): ZIO[Env, Throwable, Option[IssuedRefreshToken]] =
+    ZIO
+      .serviceWithZIO[AuthStore[TestUser]](_.findRefreshToken(RefreshTokenHash.hash(token, cfg.pepper.value)))
+      .mapError(e => new AssertionError(e.toString))
+
+  /** The authorize page for a CIMD `client_id`: a refused document URL is answered as an unknown client. */
+  private def authorizeCimd(routes: Routes[Env, Response], cid: String): ZIO[Env & Scope, Throwable, String] =
+    routes
+      .runZIO(Request.get(url("/oauth/authorize").addQueryParams(authorizeQuery(cid = ClientId.of(cid)))))
+      .flatMap(_.body.asString)
+
   def spec = suite("AuthServer")(
     test("a magic link signs in, and the session cookie shows the home page") {
       for
@@ -301,5 +324,77 @@ object AuthServerSpec extends ZIOSpecDefault:
         code     <- authorize(cookies)
         statuses <- ZIO.foreachPar(1 to 20)(_ => exchange(code).map(_.status))
       yield assertTrue(statuses.count(_ == (Status.Ok: Status)) == 1)
+    },
+    test("a refresh gets the user's current scopes, and once the user is gone it fails and revokes the chain") {
+      for
+        email    <- freshEmail
+        cookies  <- signIn(email)
+        tokens   <- authorize(cookies).flatMap(exchange).flatMap(json[TokenBody])
+        u        <- user(email)
+        promoted  = Set(OAuthScope.of("role:author"))
+        _        <- ZIO.serviceWithZIO[InMemoryAuthStore[TestUser]](_.putUser(u.copy(scopes = promoted)))
+        rotated  <- refresh(tokens.refresh_token.get).flatMap(json[TokenBody])
+        rt2       = rotated.refresh_token.get
+        _        <- ZIO.serviceWithZIO[InMemoryAuthStore[TestUser]](_.removeUser(u.id))
+        gone     <- refresh(rt2)
+        err      <- json[TokenError](gone)
+        rt2Row   <- refreshTokenRow(rt2)
+      yield assertTrue(
+        scopesOf(tokens) == Set(OAuthScope.of("role:user")),
+        scopesOf(rotated) == promoted,
+        gone.status == (Status.BadRequest: Status),
+        err.error == "invalid_grant",
+        rt2Row.exists(_.revokedAt.isDefined),
+      )
+    },
+    test("a refresh token that holds a scope the client asked for, but clients may not have, loses it") {
+      for
+        email   <- freshEmail
+        _       <- signIn(email)
+        u       <- user(email)
+        _       <- registerClient()
+        now     <- Clock.instant
+        plain   <- Random.nextUUID.map(id => s"legacy-$id")
+        hash     = RefreshTokenHash.hash(plain, cfg.pepper.value)
+        // As issued before `clientScopes`: the role the client asked for went into the token.
+        legacy   = IssuedRefreshToken(hash, hash, None, clientId, Some(u.id), Set(OAuthScope.of("role:admin"), OAuthScope.of("role:user")),
+                     None, now, now.plusSeconds(3600), None, None, None)
+        _       <- ZIO.serviceWithZIO[AuthStore[TestUser]](_.createRefreshToken(legacy)).mapError(e => new AssertionError(e.toString))
+        tokens  <- refresh(plain).flatMap(json[TokenBody])
+      yield assertTrue(scopesOf(tokens) == Set(OAuthScope.of("role:user")))
+    },
+    test("introspection reports a token active only to the client it was issued to") {
+      for
+        cookies <- freshEmail.flatMap(signIn)
+        tokens  <- authorize(cookies).flatMap(exchange).flatMap(json[TokenBody])
+        other    = ClientId.of("other-client")
+        _       <- registerClient(cid = other)
+        own     <- introspect(tokens.access_token, clientId)
+        foreign <- introspect(tokens.access_token, other)
+      yield assertTrue(own, !foreign)
+    },
+    test("an address gets at most otpCodesPerWindow one-time codes, and the page doesn't change") {
+      for
+        email  <- freshEmail
+        starts <- ZIO.foreach(1 to cfg.otpCodesPerWindow + 2)(_ => run(Request.post(url("/auth/otp/start"), form("email" -> email.value))))
+        sent   <- ZIO.serviceWithZIO[RecordingMailer](_.sent).map(_.count(_.to == email))
+      yield assertTrue(
+        sent == cfg.otpCodesPerWindow,
+        starts.map(r => (r.status, location(r).map(_.encode))).distinct.size == 1,
+      )
+    },
+    test("a CIMD client_id at a private address, or on loopback in production, isn't fetched") {
+      val production = AuthServer[TestUser](cfg.copy(cimdAllowLoopback = false), Pages.default[TestUser], Messages.default("Test")).routes
+      for
+        metadata <- authorizeCimd(routes, "https://169.254.169.254/latest/meta-data")
+        internal <- authorizeCimd(routes, "https://10.1.2.3/client.json")
+        loopback <- authorizeCimd(production, "http://127.0.0.1:1/client.json")
+        plain    <- authorizeCimd(routes, "http://93.184.215.14/client.json")
+      yield assertTrue(
+        metadata.contains("unknown client_id"),
+        internal.contains("unknown client_id"),
+        loopback.contains("unknown client_id"),
+        plain.contains("unknown client_id"),
+      )
     },
   ).provideSomeLayerShared[Scope](env.orDie) @@ TestAspect.withLiveClock @@ TestAspect.withLiveRandom

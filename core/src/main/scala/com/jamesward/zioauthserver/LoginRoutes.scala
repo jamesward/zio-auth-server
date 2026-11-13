@@ -152,6 +152,15 @@ final class LoginRoutes[U: Tag](cfg: AuthServerConfig, pages: Pages[U], messages
   private def sendCode(email: Email): RIO[Env, Unit] =
     for
       now    <- Clock.instant
+      since   = now.minus(java.time.Duration.ofMillis(cfg.otpWindow.toMillis))
+      recent <- store.flatMap(_.countOtpChallengesSince(email, since)).mapError(Sessions.asThrowable)
+      // Over the limit nothing is sent, and the page is the same as when a code goes out (AuthServerConfig.otpCodesPerWindow).
+      _      <- if recent < cfg.otpCodesPerWindow then mintAndMailCode(email, now)
+                else ZIO.logWarning(s"one-time code not sent: $recent codes for this address since $since")
+    yield ()
+
+  private def mintAndMailCode(email: Email, now: java.time.Instant): RIO[Env, Unit] =
+    for
       minted <- OtpOps.mint(cfg, email)
       cid    <- EmailOtpChallengeId.mint
       ttl     = java.time.Duration.ofMillis(cfg.otpTtl.toMillis)

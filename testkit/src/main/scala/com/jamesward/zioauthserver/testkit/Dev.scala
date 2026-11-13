@@ -19,7 +19,8 @@ object DevConfig:
   val pepper: Pepper = Pepper.of("dev-pepper-not-secret")
 
   def authServer(baseUrl: URL): AuthServerConfig =
-    AuthServerConfig(baseUrl = baseUrl, cookies = cookies, pepper = pepper)
+    // Loopback CIMD documents: a dev or test client's metadata is served from localhost.
+    AuthServerConfig(baseUrl = baseUrl, cookies = cookies, pepper = pepper, cimdAllowLoopback = true)
 
 object DevSessions:
 

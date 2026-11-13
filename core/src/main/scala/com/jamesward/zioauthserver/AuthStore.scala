@@ -24,9 +24,19 @@ trait AuthStore[U]:
   def createChallenge(challenge: EmailLoginChallenge): IO[StoreError, Unit]
   def verifyAndStartSession(request: VerifyAndStartSessionRequest): IO[VerifyError, U]
   def createOtpChallenge(challenge: EmailOtpChallenge): IO[StoreError, Unit]
+
+  /** How many one-time codes were created for `email` at or after `since`, for the rate limit on sending them. */
+  def countOtpChallengesSince(email: Email, since: Instant): IO[StoreError, Int]
+
   def verifyOtpAndStartSession(request: VerifyOtpAndStartSessionRequest): IO[VerifyOtpError, U]
   def findSession(idHash: SessionIdHash): IO[StoreError, Option[(Session, U)]]
   def deleteSession(idHash: SessionIdHash): IO[StoreError, Unit]
+
+  /**
+   * The user, if they may still get tokens: `None` when deleted or disabled. A refresh reads the user again, so a
+   * disabled user's refresh token stops working and a new token carries the user's current scopes.
+   */
+  def findActiveUser(id: UserId): IO[StoreError, Option[U]]
 
   // OAuth clients, codes and tokens
   def createClient(client: OAuthClient): IO[StoreError, Unit]

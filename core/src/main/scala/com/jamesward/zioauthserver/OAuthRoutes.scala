@@ -149,18 +149,18 @@ final class OAuthRoutes[R, U: Tag](cfg: AuthServerConfig, gate: AuthorizeGate[R,
         case None            => ZIO.none
       }
 
-  // CIMD documents are fetched server-side, so restrict the schemes dereferenced to limit SSRF: HTTPS anywhere, plus
-  // loopback HTTP for local development.
+  // A URL-shaped client_id is a CIMD client; which URLs are actually fetched is CimdAddressPolicy's call.
   private def cimdEligible(url: String): Boolean =
-    url.startsWith("https://") ||
-      url.startsWith("http://localhost") ||
-      url.startsWith("http://127.0.0.1")
+    url.startsWith("https://") || url.startsWith("http://")
 
   private def resolveCimdClient(cid: ClientId): URIO[Client & AuthStore[U], Option[OAuthClient]] =
     val url   = cid.value
     val fetch =
       for
         now           <- Clock.instant
+        _             <- CimdAddressPolicy
+                           .check(url, cfg.cimdAllowLoopback)
+                           .mapError(r => new RuntimeException(s"CIMD url refused: ${r.message}"))
         reqUrl        <- ZIO.fromEither(URL.decode(url)).mapError(e => new RuntimeException(s"invalid CIMD url: $e"))
         resp          <- ZIO.serviceWithZIO[Client](_.batched(Request.get(reqUrl)))
         _             <- ZIO.fail(new RuntimeException(s"CIMD fetch returned ${resp.status.code}")).when(!resp.status.isSuccess)
@@ -582,12 +582,30 @@ final class OAuthRoutes[R, U: Tag](cfg: AuthServerConfig, gate: AuthorizeGate[R,
                     tokenFailure(Status.BadRequest, "invalid_grant", "refresh_token has no associated user")
                   )(ZIO.succeed(_))
 
-        // RFC 6749 §6: the requested scope MUST be a subset of the original. Default to the original scope set.
-        nextScopes <- scope match
+        // The user as of now: a deleted or disabled user's chain is revoked and the refresh fails.
+        userOpt <- store.flatMap(_.findActiveUser(userId)).catchAllCause(c =>
+                     ZIO.logErrorCause("token endpoint: findActiveUser failed (refresh grant)", c) *> internalErr
+                   )
+        user    <- userOpt match
+                     case Some(u) => ZIO.succeed(u)
+                     case None    =>
+                       ZIO.logWarning(s"token endpoint: refresh for a user who may no longer get tokens: ${userId.value}") *>
+                         store
+                           .flatMap(_.revokeRefreshTokenIfOwned(RevokeRefreshTokenRequest(rtRow.hash, client.id)))
+                           .catchAllCause(c => ZIO.logErrorCause("token endpoint: revoking an inactive user's chain failed", c)) *>
+                         tokenFailure(Status.BadRequest, "invalid_grant", "refresh_token revoked")
+
+        // RFC 6749 §6: the requested scope MUST be a subset of the original. Default to the original scope set. The
+        // stored scopes hold the user's scopes of the time; the new token gets the user's current ones instead, plus
+        // the requested scopes clients may have. So a role taken away is gone at the next refresh, and a token from
+        // before `clientScopes` (one that asked for `role:admin`) loses what it asked for.
+        requested  <- scope match
                         case None    => ZIO.succeed(rtRow.scopes)
                         case Some(s) =>
                           if s.subsetOf(rtRow.scopes) then ZIO.succeed(s)
                           else tokenFailure(Status.BadRequest, "invalid_scope", "requested scope exceeds original")
+        userScopes  = summon[AccountView[U]].scopes(user)
+        nextScopes  = requested.filter(cfg.clientScopes) ++ scope.fold(userScopes)(s => userScopes.filter(s.contains))
 
         ttl       = client.profile.accessTokenTtl
         expiresAt = now.plus(java.time.Duration.ofMillis(ttl.toMillis))
@@ -723,21 +741,22 @@ final class OAuthRoutes[R, U: Tag](cfg: AuthServerConfig, gate: AuthorizeGate[R,
         tokenStr   = form.get("token").flatMap(_.stringValue).getOrElse("")
         cliEither <- authenticateClient(req, form).either
         response  <- cliEither match
-                       case Left(_)  => ZIO.succeed(inactiveResponse)
-                       case Right(_) =>
+                       case Left(_)       => ZIO.succeed(inactiveResponse)
+                       case Right(client) =>
                          if tokenStr.isEmpty then ZIO.succeed(inactiveResponse)
-                         else introspectActive(tokenStr)
+                         else introspectActive(tokenStr, client)
       yield response
     effect.catchAllCause(c => ZIO.logErrorCause("introspect crashed", c).as(inactiveResponse))
 
-  private def introspectActive(tokenStr: String): RIO[Env, Response] =
+  /** A token is reported active only to the client it was issued to, or to one in `introspectAnyToken`. */
+  private def introspectActive(tokenStr: String, client: OAuthClient): RIO[Env, Response] =
     val tHash = AccessTokenHash.fromBytes(Crypto.hmacSha256(tokenStr, cfg.pepper.value))
     for
       tokOpt <- store.flatMap(_.findAccessToken(tHash)).mapError(Sessions.asThrowable)
       now    <- Clock.instant
     yield tokOpt match
-      case Some(tok) if tok.isActive(now) => activeResponse(tok)
-      case _                              => inactiveResponse
+      case Some(tok) if tok.isActive(now) && (tok.clientId == client.id || cfg.introspectAnyToken(client)) => activeResponse(tok)
+      case _                                                                                                => inactiveResponse
 
   private val revokeOk: Response = Response.ok
 
