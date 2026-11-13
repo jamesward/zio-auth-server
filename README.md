@@ -13,6 +13,9 @@ first-party email sign-in, for apps whose MCP servers and web pages need signed-
 - **OAuth 2.1 for MCP clients**: authorization code with PKCE (S256 only), refresh tokens that rotate and revoke their
   whole chain on replay, Dynamic Client Registration, Client ID Metadata Documents, resource indicators, token
   introspection and revocation, and `/.well-known/oauth-authorization-server`.
+- **Consent and scopes**: a signed-in user approves each client on a consent page (`Pages.consent`) before it gets a
+  code, except clients you list in `AuthServerConfig.skipConsent`. A token carries the user's own scopes plus only the
+  requested scopes in `AuthServerConfig.clientScopes`, so a client can't ask its way to a role.
 - **Your user type, your storage**: the server is generic over the app's user type (`AccountView[U]` says what it
   needs from it) and persists through the `AuthStore[U]` port, so an app can keep the data in its own database or
   behind its own API. Only hashes of secrets (HMAC with a pepper) are stored.
