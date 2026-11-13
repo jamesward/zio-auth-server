@@ -8,18 +8,29 @@ import zio.test.*
 import java.time.Instant
 
 /**
- * The behavior every store implementation must have: single-use links, codes, grants, ceremonies and states; atomic
- * refresh-token rotation with replay revoking the chain; revocation only by the owning client; the sign-up policy;
- * email changes; passkeys and connections. Run it from the implementation's tests:
+ * The behavior every store implementation must have, one suite per store interface, so a store that implements only
+ * some of them (toolbook's API-backed `AuthStore`) runs the suites it can:
+ *
+ *   - [[authStore]]: single-use links and codes (five wrong codes lock one), sessions, single-use grants (also under 20
+ *     concurrent exchanges), revocation only by the owning client, refresh-token rotation once (also under 10 concurrent
+ *     rotations) with a replay revoking the whole chain. Needs a store that signs up new addresses (the contract uses
+ *     random `@example.com` ones), as [[SignUpPolicy.Open]] does.
+ *   - [[signUpPolicy]]: `ExistingUsersOnly` and `Allowlist`, for a store whose policy is configurable.
+ *   - [[accountStore]], [[passkeyStore]], [[connectionStore]]: the optional interfaces. Each needs the `AuthStore` too,
+ *     to sign up the users its rows belong to.
+ *   - [[spec]]: all of them, for a store that implements every interface.
  *
  * {{{
  * object MyStoreSpec extends ZIOSpecDefault:
  *   def spec = AuthStoreContract.spec[DataSource, AuthUser]("MyStore", policy => MyStore.layer(policy))
  *     .provideShared(postgres)
+ *
+ * object ApiStoreSpec extends ZIOSpecDefault:
+ *   def spec = AuthStoreContract.authStore[Env, User]("ApiAuthStore", apiStoreLayer).provideShared(api)
  * }}}
  *
- * `make` builds a store with the given [[SignUpPolicy]]. A database store may share its data between the stores it
- * makes: every test uses its own random addresses and ids.
+ * Each test gets its store from the layer it is given, built for that test. A database store may share its data
+ * between them: every test uses its own random addresses and ids.
  */
 object AuthStoreContract:
 
@@ -27,16 +38,55 @@ object AuthStoreContract:
 
   private val pepper = "contract-pepper"
 
+  private def live[R](spec: Spec[R, Throwable]): Spec[R, Throwable] =
+    spec @@ TestAspect.withLiveClock @@ TestAspect.withLiveRandom
+
+  /** Every suite, for a store that implements all four interfaces. `make` builds one with the given policy. */
   def spec[R, U: Tag](name: String, make: SignUpPolicy => ZLayer[R, Throwable, Stores[U]])(using
-      view: AccountView[U]
+      AccountView[U]
   ): Spec[R, Throwable] =
+    val open = make(SignUpPolicy.Open)
+    live(suite(s"$name: AuthStore contract")(
+      authStoreSuites[R, U](open),
+      signUpPolicySuite[R, U](make),
+      accountStoreSuite[R, U](open),
+      passkeyStoreSuite[R, U](open),
+      connectionStoreSuite[R, U](open),
+    ))
+
+  /** The [[AuthStore]] suites, for a store that signs up new addresses. */
+  def authStore[R, U: Tag](name: String, store: ZLayer[R, Throwable, AuthStore[U]])(using AccountView[U]): Spec[R, Throwable] =
+    live(suite(s"$name: AuthStore contract")(authStoreSuites[R, U](store)))
+
+  /** The [[SignUpPolicy]] suite. `make` builds a store with the given policy. */
+  def signUpPolicy[R, U: Tag](name: String, make: SignUpPolicy => ZLayer[R, Throwable, AuthStore[U]])(using
+      AccountView[U]
+  ): Spec[R, Throwable] =
+    live(suite(s"$name: SignUpPolicy contract")(signUpPolicySuite[R, U](make)))
+
+  def accountStore[R, U: Tag](name: String, stores: ZLayer[R, Throwable, AuthStore[U] & AccountStore[U]])(using
+      AccountView[U]
+  ): Spec[R, Throwable] =
+    live(suite(s"$name: AccountStore contract")(accountStoreSuite[R, U](stores)))
+
+  def passkeyStore[R, U: Tag](name: String, stores: ZLayer[R, Throwable, AuthStore[U] & PasskeyStore])(using
+      AccountView[U]
+  ): Spec[R, Throwable] =
+    live(suite(s"$name: PasskeyStore contract")(passkeyStoreSuite[R, U](stores)))
+
+  def connectionStore[R, U: Tag](name: String, stores: ZLayer[R, Throwable, AuthStore[U] & ConnectionStore])(using
+      AccountView[U]
+  ): Spec[R, Throwable] =
+    live(suite(s"$name: ConnectionStore contract")(connectionStoreSuite[R, U](stores)))
+
+  private def authStoreSuites[R, U: Tag](layer: ZLayer[R, Throwable, AuthStore[U]])(using view: AccountView[U]): Spec[R, Throwable] =
     val ops = Ops[U]()
     import ops.*
 
-    def open(test: ZIO[Stores[U], Any, TestResult]): ZIO[R, Throwable, TestResult] =
-      test.mapError(asThrowable).provideSomeLayer[R](make(SignUpPolicy.Open))
+    def open(test: ZIO[AuthStore[U], Any, TestResult]): ZIO[R, Throwable, TestResult] =
+      test.mapError(asThrowable).provideSomeLayer[R](layer)
 
-    suite(s"$name: AuthStore contract")(
+    suite("AuthStore")(
       suite("email sign-in")(
         test("a magic link signs up a new address once, then signs in the same user") {
           open(
@@ -106,40 +156,6 @@ object AuthStoreContract:
               gone    <- store(_.findSession(sh))
             yield assertTrue(found.map(p => view.id(p._2)) == Some(view.id(u)), gone.isEmpty)
           )
-        },
-      ),
-      suite("sign-up policy")(
-        test("ExistingUsersOnly never creates an account, and doesn't offer to send a link") {
-          for
-            email   <- freshEmail
-            result  <- (for
-                         may    <- store(_.mayStartSignIn(email))
-                         now    <- Clock.instant
-                         link   <- createLink(email, now.plusSeconds(600))
-                         signed <- verifyLink(link).either
-                       yield (may, signed)).provideSomeLayer[R](make(SignUpPolicy.ExistingUsersOnly))
-          yield assertTrue(!result._1, result._2 == Left(VerifyError.NotFound))
-        },
-        test("Allowlist admits the listed address, then treats it as an existing user") {
-          for
-            allowed  <- freshEmail
-            stranger <- freshEmail
-            result   <- (for
-                          mayAllowed  <- store(_.mayStartSignIn(allowed))
-                          mayStranger <- store(_.mayStartSignIn(stranger))
-                          user        <- signIn(allowed)
-                          now         <- Clock.instant
-                          link        <- createLink(stranger, now.plusSeconds(600))
-                          refused     <- verifyLink(link).either
-                        yield (mayAllowed, mayStranger, view.email(user), refused))
-                          .provideSomeLayer[R](make(SignUpPolicy.Allowlist(Set(allowed))))
-            existing <- store(_.mayStartSignIn(allowed)).provideSomeLayer[R](make(SignUpPolicy.ExistingUsersOnly))
-          yield assertTrue(
-            result._1,
-            !result._2,
-            result._3 == allowed,
-            result._4 == Left(VerifyError.NotFound),
-          ) && (if existing then assertTrue(existing) else assertCompletes) // a fresh in-memory store forgets the user
         },
       ),
       suite("authorization codes")(
@@ -242,131 +258,194 @@ object AuthStoreContract:
           )
         },
       ),
-      suite("accounts")(
-        test("a session starts for an existing user, not for an unknown one") {
-          open(
-            for
-              user    <- freshEmail.flatMap(signIn)
-              now     <- Clock.instant
-              sh       = SessionIdHash.fromBytes(randomBytes())
-              started <- account(_.startSession(view.id(user), sh, CsrfTokenHash.fromBytes(randomBytes()), now.plusSeconds(3600)))
-              found   <- store(_.findSession(sh))
-              nobody  <- account(_.startSession(UserId.fresh(java.util.UUID.randomUUID()), SessionIdHash.fromBytes(randomBytes()),
-                           CsrfTokenHash.fromBytes(randomBytes()), now.plusSeconds(3600)))
-            yield assertTrue(started.map(view.id) == Some(view.id(user)), found.isDefined, nobody.isEmpty)
+    )
+
+  private def signUpPolicySuite[R, U: Tag](make: SignUpPolicy => ZLayer[R, Throwable, AuthStore[U]])(using view: AccountView[U]): Spec[R, Throwable] =
+    val ops = Ops[U]()
+    import ops.*
+
+    suite("sign-up policy")(
+      test("ExistingUsersOnly never creates an account, and doesn't offer to send a link") {
+        for
+          email   <- freshEmail
+          result  <- (for
+                       may    <- store(_.mayStartSignIn(email))
+                       now    <- Clock.instant
+                       link   <- createLink(email, now.plusSeconds(600))
+                       signed <- verifyLink(link).either
+                     yield (may, signed)).provideSomeLayer[R](make(SignUpPolicy.ExistingUsersOnly))
+        yield assertTrue(!result._1, result._2 == Left(VerifyError.NotFound))
+      },
+      test("Allowlist admits the listed address, then treats it as an existing user") {
+        for
+          allowed  <- freshEmail
+          stranger <- freshEmail
+          result   <- (for
+                        mayAllowed  <- store(_.mayStartSignIn(allowed))
+                        mayStranger <- store(_.mayStartSignIn(stranger))
+                        user        <- signIn(allowed)
+                        now         <- Clock.instant
+                        link        <- createLink(stranger, now.plusSeconds(600))
+                        refused     <- verifyLink(link).either
+                      yield (mayAllowed, mayStranger, view.email(user), refused))
+                        .provideSomeLayer[R](make(SignUpPolicy.Allowlist(Set(allowed))))
+          existing <- store(_.mayStartSignIn(allowed)).provideSomeLayer[R](make(SignUpPolicy.ExistingUsersOnly))
+        yield assertTrue(
+          result._1,
+          !result._2,
+          result._3 == allowed,
+          result._4 == Left(VerifyError.NotFound),
+        ) && (if existing then assertTrue(existing) else assertCompletes) // a fresh in-memory store forgets the user
+      },
+    )
+
+  private def accountStoreSuite[R, U: Tag](layer: ZLayer[R, Throwable, AuthStore[U] & AccountStore[U]])(using view: AccountView[U]): Spec[R, Throwable] =
+    val ops = Ops[U]()
+    import ops.*
+
+    def open(test: ZIO[AuthStore[U] & AccountStore[U], Any, TestResult]): ZIO[R, Throwable, TestResult] =
+      test.mapError(asThrowable).provideSomeLayer[R](layer)
+
+    suite("accounts")(
+      test("a session starts for an existing user, not for an unknown one") {
+        open(
+          for
+            user    <- freshEmail.flatMap(signIn)
+            now     <- Clock.instant
+            sh       = SessionIdHash.fromBytes(randomBytes())
+            started <- accountCall(_.startSession(view.id(user), sh, CsrfTokenHash.fromBytes(randomBytes()), now.plusSeconds(3600)))
+            found   <- store(_.findSession(sh))
+            nobody  <- accountCall(_.startSession(UserId.fresh(java.util.UUID.randomUUID()), SessionIdHash.fromBytes(randomBytes()),
+                         CsrfTokenHash.fromBytes(randomBytes()), now.plusSeconds(3600)))
+          yield assertTrue(started.map(view.id) == Some(view.id(user)), found.isDefined, nobody.isEmpty)
+        )
+      },
+      test("an email change moves the user once, and not onto another user's address") {
+        open(
+          for
+            user     <- freshEmail.flatMap(signIn)
+            taken    <- freshEmail.flatMap(signIn)
+            newEmail <- freshEmail
+            now      <- Clock.instant
+            ok        = MagicTokenHash.fromBytes(randomBytes())
+            _        <- accountCall(_.createEmailChange(EmailChangeChallenge(EmailChangeId.fresh(java.util.UUID.randomUUID()),
+                          view.id(user), newEmail, ok, now, now.plusSeconds(600), None)))
+            moved    <- accountCall(_.confirmEmailChange(ok, now)).either
+            again    <- accountCall(_.confirmEmailChange(ok, now)).either
+            clash     = MagicTokenHash.fromBytes(randomBytes())
+            _        <- accountCall(_.createEmailChange(EmailChangeChallenge(EmailChangeId.fresh(java.util.UUID.randomUUID()),
+                          view.id(user), view.email(taken), clash, now, now.plusSeconds(600), None)))
+            refused  <- accountCall(_.confirmEmailChange(clash, now)).either
+            reloaded <- accountCall(_.findUser(view.id(user)))
+          yield assertTrue(
+            moved.map(view.email) == Right(newEmail),
+            again == Left(EmailChangeError.AlreadyConsumed),
+            refused == Left(EmailChangeError.EmailTaken),
+            reloaded.map(view.email) == Some(newEmail),
           )
-        },
-        test("an email change moves the user once, and not onto another user's address") {
-          open(
-            for
-              user     <- freshEmail.flatMap(signIn)
-              taken    <- freshEmail.flatMap(signIn)
-              newEmail <- freshEmail
-              now      <- Clock.instant
-              ok        = MagicTokenHash.fromBytes(randomBytes())
-              _        <- account(_.createEmailChange(EmailChangeChallenge(EmailChangeId.fresh(java.util.UUID.randomUUID()),
-                            view.id(user), newEmail, ok, now, now.plusSeconds(600), None)))
-              moved    <- account(_.confirmEmailChange(ok, now)).either
-              again    <- account(_.confirmEmailChange(ok, now)).either
-              clash     = MagicTokenHash.fromBytes(randomBytes())
-              _        <- account(_.createEmailChange(EmailChangeChallenge(EmailChangeId.fresh(java.util.UUID.randomUUID()),
-                            view.id(user), view.email(taken), clash, now, now.plusSeconds(600), None)))
-              refused  <- account(_.confirmEmailChange(clash, now)).either
-              reloaded <- account(_.findUser(view.id(user)))
-            yield assertTrue(
-              moved.map(view.email) == Right(newEmail),
-              again == Left(EmailChangeError.AlreadyConsumed),
-              refused == Left(EmailChangeError.EmailTaken),
-              reloaded.map(view.email) == Some(newEmail),
-            )
+        )
+      },
+    )
+
+  private def passkeyStoreSuite[R, U: Tag](layer: ZLayer[R, Throwable, AuthStore[U] & PasskeyStore])(using view: AccountView[U]): Spec[R, Throwable] =
+    val ops = Ops[U]()
+    import ops.*
+
+    def open(test: ZIO[AuthStore[U] & PasskeyStore, Any, TestResult]): ZIO[R, Throwable, TestResult] =
+      test.mapError(asThrowable).provideSomeLayer[R](layer)
+
+    suite("passkeys")(
+      test("passkeys are added once, listed, used, and removed only by their user") {
+        open(
+          for
+            user    <- freshEmail.flatMap(signIn)
+            other   <- freshEmail.flatMap(signIn)
+            now     <- Clock.instant
+            pk       = passkey(view.id(user), now)
+            _       <- passkeyCall(_.addPasskey(pk))
+            dup     <- passkeyCall(_.addPasskey(pk)).either
+            listed  <- passkeyCall(_.passkeys(view.id(user)))
+            _       <- passkeyCall(_.recordPasskeyUse(pk.credentialId, 7, now))
+            used    <- passkeyCall(_.findPasskey(pk.credentialId))
+            byOther <- passkeyCall(_.removePasskey(view.id(other), pk.credentialId))
+            byOwner <- passkeyCall(_.removePasskey(view.id(user), pk.credentialId))
+            gone    <- passkeyCall(_.findPasskey(pk.credentialId))
+          yield assertTrue(
+            dup == Left(PasskeyError.DuplicateCredential),
+            listed.map(_.credentialId) == List(pk.credentialId),
+            used.map(_.signatureCount) == Some(7L),
+            used.flatMap(_.lastUsedAt).isDefined,
+            !byOther,
+            byOwner,
+            gone.isEmpty,
           )
-        },
-      ),
-      suite("passkeys")(
-        test("passkeys are added once, listed, used, and removed only by their user") {
-          open(
-            for
-              user    <- freshEmail.flatMap(signIn)
-              other   <- freshEmail.flatMap(signIn)
-              now     <- Clock.instant
-              pk       = passkey(view.id(user), now)
-              _       <- passkeyStore(_.addPasskey(pk))
-              dup     <- passkeyStore(_.addPasskey(pk)).either
-              listed  <- passkeyStore(_.passkeys(view.id(user)))
-              _       <- passkeyStore(_.recordPasskeyUse(pk.credentialId, 7, now))
-              used    <- passkeyStore(_.findPasskey(pk.credentialId))
-              byOther <- passkeyStore(_.removePasskey(view.id(other), pk.credentialId))
-              byOwner <- passkeyStore(_.removePasskey(view.id(user), pk.credentialId))
-              gone    <- passkeyStore(_.findPasskey(pk.credentialId))
-            yield assertTrue(
-              dup == Left(PasskeyError.DuplicateCredential),
-              listed.map(_.credentialId) == List(pk.credentialId),
-              used.map(_.signatureCount) == Some(7L),
-              used.flatMap(_.lastUsedAt).isDefined,
-              !byOther,
-              byOwner,
-              gone.isEmpty,
-            )
-          )
-        },
-        test("a ceremony is taken once, and not after it expires") {
-          open(
-            for
-              now     <- Clock.instant
-              live     = PasskeyCeremony(PasskeyCeremonyId.fresh(java.util.UUID.randomUUID()), PasskeyCeremonyKind.Assertion, None, "{}", now.plusSeconds(300))
-              old      = PasskeyCeremony(PasskeyCeremonyId.fresh(java.util.UUID.randomUUID()), PasskeyCeremonyKind.Assertion, None, "{}", now.minusSeconds(1))
-              _       <- passkeyStore(_.createCeremony(live))
-              _       <- passkeyStore(_.createCeremony(old))
-              first   <- passkeyStore(_.takeCeremony(live.id, now))
-              second  <- passkeyStore(_.takeCeremony(live.id, now))
-              expired <- passkeyStore(_.takeCeremony(old.id, now))
-            yield assertTrue(first.map(_.id) == Some(live.id), second.isEmpty, expired.isEmpty)
-          )
-        },
-      ),
-      suite("connections")(
-        test("a connection state is taken once, and not after it expires") {
-          open(
-            for
-              user    <- freshEmail.flatMap(signIn)
-              now     <- Clock.instant
-              live     = ConnectionState(randomText(), view.id(user), "github", "verifier", Some("/"), now.plusSeconds(300))
-              old      = ConnectionState(randomText(), view.id(user), "github", "verifier", None, now.minusSeconds(1))
-              _       <- connections(_.createConnectionState(live))
-              _       <- connections(_.createConnectionState(old))
-              first   <- connections(_.takeConnectionState(live.stateHash, now))
-              second  <- connections(_.takeConnectionState(live.stateHash, now))
-              expired <- connections(_.takeConnectionState(old.stateHash, now))
-            yield assertTrue(first.map(_.stateHash) == Some(live.stateHash), first.map(_.codeVerifier) == Some(live.codeVerifier), second.isEmpty, expired.isEmpty)
-          )
-        },
-        test("a connection is saved, replaced, found and deleted per user and provider") {
-          open(
-            for
-              user    <- freshEmail.flatMap(signIn)
-              now     <- Clock.instant
-              c1       = Connection(view.id(user), "github", "42", "v1.first", now, now)
-              _       <- connections(_.saveConnection(c1))
-              c2       = c1.copy(sealedTokens = "v1.second", updatedAt = now.plusSeconds(1))
-              _       <- connections(_.saveConnection(c2))
-              found   <- connections(_.findConnection(view.id(user), "github"))
-              other   <- connections(_.findConnection(view.id(user), "gitlab"))
-              deleted <- connections(_.deleteConnection(view.id(user), "github"))
-              again   <- connections(_.deleteConnection(view.id(user), "github"))
-            yield assertTrue(found.map(_.sealedTokens) == Some("v1.second"), other.isEmpty, deleted, !again)
-          )
-        },
-      ),
-    ) @@ TestAspect.withLiveClock @@ TestAspect.withLiveRandom
+        )
+      },
+      test("a ceremony is taken once, and not after it expires") {
+        open(
+          for
+            now     <- Clock.instant
+            live     = PasskeyCeremony(PasskeyCeremonyId.fresh(java.util.UUID.randomUUID()), PasskeyCeremonyKind.Assertion, None, "{}", now.plusSeconds(300))
+            old      = PasskeyCeremony(PasskeyCeremonyId.fresh(java.util.UUID.randomUUID()), PasskeyCeremonyKind.Assertion, None, "{}", now.minusSeconds(1))
+            _       <- passkeyCall(_.createCeremony(live))
+            _       <- passkeyCall(_.createCeremony(old))
+            first   <- passkeyCall(_.takeCeremony(live.id, now))
+            second  <- passkeyCall(_.takeCeremony(live.id, now))
+            expired <- passkeyCall(_.takeCeremony(old.id, now))
+          yield assertTrue(first.map(_.id) == Some(live.id), second.isEmpty, expired.isEmpty)
+        )
+      },
+    )
+
+  private def connectionStoreSuite[R, U: Tag](layer: ZLayer[R, Throwable, AuthStore[U] & ConnectionStore])(using view: AccountView[U]): Spec[R, Throwable] =
+    val ops = Ops[U]()
+    import ops.*
+
+    def open(test: ZIO[AuthStore[U] & ConnectionStore, Any, TestResult]): ZIO[R, Throwable, TestResult] =
+      test.mapError(asThrowable).provideSomeLayer[R](layer)
+
+    suite("connections")(
+      test("a connection state is taken once, and not after it expires") {
+        open(
+          for
+            user    <- freshEmail.flatMap(signIn)
+            now     <- Clock.instant
+            live     = ConnectionState(randomText(), view.id(user), "github", "verifier", Some("/"), now.plusSeconds(300))
+            old      = ConnectionState(randomText(), view.id(user), "github", "verifier", None, now.minusSeconds(1))
+            _       <- connectionCall(_.createConnectionState(live))
+            _       <- connectionCall(_.createConnectionState(old))
+            first   <- connectionCall(_.takeConnectionState(live.stateHash, now))
+            second  <- connectionCall(_.takeConnectionState(live.stateHash, now))
+            expired <- connectionCall(_.takeConnectionState(old.stateHash, now))
+          yield assertTrue(first.map(_.stateHash) == Some(live.stateHash), first.map(_.codeVerifier) == Some(live.codeVerifier), second.isEmpty, expired.isEmpty)
+        )
+      },
+      test("a connection is saved, replaced, found and deleted per user and provider") {
+        open(
+          for
+            user    <- freshEmail.flatMap(signIn)
+            now     <- Clock.instant
+            c1       = Connection(view.id(user), "github", "42", "v1.first", now, now)
+            _       <- connectionCall(_.saveConnection(c1))
+            c2       = c1.copy(sealedTokens = "v1.second", updatedAt = now.plusSeconds(1))
+            _       <- connectionCall(_.saveConnection(c2))
+            found   <- connectionCall(_.findConnection(view.id(user), "github"))
+            other   <- connectionCall(_.findConnection(view.id(user), "gitlab"))
+            deleted <- connectionCall(_.deleteConnection(view.id(user), "github"))
+            again   <- connectionCall(_.deleteConnection(view.id(user), "github"))
+          yield assertTrue(found.map(_.sealedTokens) == Some("v1.second"), other.isEmpty, deleted, !again)
+        )
+      },
+    )
 
   private final class Ops[U: Tag](using view: AccountView[U]):
     def store[A](f: AuthStore[U] => IO[Any, A]): ZIO[AuthStore[U], Throwable, A] =
       ZIO.serviceWithZIO[AuthStore[U]](f).mapError(asThrowable)
     def rotate(request: RotateRefreshTokenRequest): ZIO[AuthStore[U], RotateRefreshTokenError, Unit] =
       ZIO.serviceWithZIO[AuthStore[U]](_.rotateRefreshToken(request))
-    def account[A, E](f: AccountStore[U] => IO[E, A]): ZIO[AccountStore[U], E, A] = ZIO.serviceWithZIO[AccountStore[U]](f)
-    def passkeyStore[A, E](f: PasskeyStore => IO[E, A]): ZIO[PasskeyStore, E, A]  = ZIO.serviceWithZIO[PasskeyStore](f)
-    def connections[A](f: ConnectionStore => IO[StoreError, A]): ZIO[ConnectionStore, Throwable, A] =
+    def accountCall[A, E](f: AccountStore[U] => IO[E, A]): ZIO[AccountStore[U], E, A] = ZIO.serviceWithZIO[AccountStore[U]](f)
+    def passkeyCall[A, E](f: PasskeyStore => IO[E, A]): ZIO[PasskeyStore, E, A]   = ZIO.serviceWithZIO[PasskeyStore](f)
+    def connectionCall[A](f: ConnectionStore => IO[StoreError, A]): ZIO[ConnectionStore, Throwable, A] =
       ZIO.serviceWithZIO[ConnectionStore](f).mapError(asThrowable)
 
     val freshEmail: UIO[Email] = ZIO.succeed(Email.parse(s"${java.util.UUID.randomUUID()}@example.com").toOption.get)

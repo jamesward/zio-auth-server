@@ -32,7 +32,10 @@ toolbook's `login` module. See `README.md` for the feature overview. Releases go
   dependency here (the contract suite is a Spec). The route specs live in `testkit`'s tests, since `core` can't depend
   on `testkit`.
 - Every store implementation runs `AuthStoreContract`: `InMemoryAuthStoreSpec`, `MagnumAuthStoreSpec` (Testcontainers
-  Postgres). A behavior every store must have goes into the contract, not into one store's spec.
+  Postgres), `AuthStoreOnlySpec` (a store with only `AuthStore`, like toolbook's). The contract has one suite per store
+  interface (`authStore`, `signUpPolicy`, `accountStore`, `passkeyStore`, `connectionStore`) and `spec` for all of
+  them, so a store runs the suites for the interfaces it implements. A behavior every store must have goes into the
+  suite for its interface, not into one store's spec.
 
 ## Skills
 

@@ -112,8 +112,9 @@ transaction's connection.
 `zio-auth-server-test` has what a test or a dev run needs and production must not have:
 
 - `InMemoryAuthStore`: every store trait in a `Ref`, with the same consume-once and rotate-once rules.
-- `AuthStoreContract`: the behavior every store must have. Run it against your own store:
-  `AuthStoreContract.spec[R, MyUser]("MyStore", policy => MyStore.layer(policy))`.
+- `AuthStoreContract`: the behavior every store must have, one suite per store interface. A store with all four runs
+  `AuthStoreContract.spec[R, MyUser]("MyStore", policy => MyStore.layer(policy))`; one that implements only some runs
+  those: `authStore`, `signUpPolicy`, `accountStore`, `passkeyStore`, `connectionStore`.
 - `SoftwareAuthenticator`: answers passkey options like a browser would, for testing passkey flows.
 - `RecordingMailer`: keeps and logs the emails instead of sending them, so a test can follow the link.
 - `DevConfig`: plain cookie names over HTTP and a fixed pepper.
