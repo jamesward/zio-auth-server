@@ -15,7 +15,48 @@ trait Pages[U]:
   def magicLinkSent: Dom
   def invalidLink: Dom
 
+  /**
+   * Asks the signed-in user to approve an OAuth client. The form must post `_csrf` (the csrf token) and `request`
+   * (the original authorize query) to `POST /oauth/authorize`, with `decision=approve` or `decision=deny`. The default
+   * is plain HTML; override it to match your look.
+   */
+  def consent(user: U, request: ConsentRequest, csrf: CsrfToken): Dom = Pages.defaultConsent(request, csrf)
+
+/** What the consent page shows: the client's name is its own claim, so the page also shows where the code goes. */
+final case class ConsentRequest(
+    clientName:   String,
+    clientId:     ClientId,
+    redirectHost: String,
+    scopes:       Set[OAuthScope],
+    query:        String,
+)
+
 object Pages:
+
+  def defaultConsent(request: ConsentRequest, csrf: CsrfToken): Dom =
+    def hidden(n: String, v: String) =
+      Dom.element("input")(Dom.attr("type", "hidden"), Dom.attr("name", n), Dom.attr("value", v))
+    def button(decision: String, label: String) =
+      Dom.element("button")(Dom.attr("type", "submit"), Dom.attr("name", "decision"), Dom.attr("value", decision), label)
+    html(
+      Dom.attr("lang", "en"),
+      head(meta(charset := "utf-8"), Dom.element("title")("Allow access?")),
+      Dom.element("body")(
+        h1("Allow access?"),
+        p(Dom.element("strong")(request.clientName), " wants to access your account."),
+        p("It will receive the authorization at ", Dom.element("strong")(request.redirectHost), "."),
+        p(Dom.element("small")("Client id: ", request.clientId.value)),
+        if request.scopes.isEmpty then Dom.empty else p("Scopes: ", OAuthScopeSet.render(request.scopes)),
+        Dom.element("form")(
+          Dom.attr("method", "post"),
+          Dom.attr("action", "/oauth/authorize"),
+          hidden("_csrf", csrf.value),
+          hidden("request", request.query),
+          button("approve", "Allow"),
+          button("deny", "Deny"),
+        ),
+      ),
+    )
 
   def default[U](using view: AccountView[U]): Pages[U] =
     new Pages[U]:

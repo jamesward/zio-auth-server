@@ -22,7 +22,7 @@ final class AuthServer[R, U: Tag](
 )(using AccountView[U]):
 
   val login: LoginRoutes[U]    = LoginRoutes(cfg, pages, messages)
-  val oauth: OAuthRoutes[R, U] = OAuthRoutes(cfg, gate)
+  val oauth: OAuthRoutes[R, U] = OAuthRoutes(cfg, gate, pages)
 
   val routes: Routes[login.Env & oauth.Env, Response] = login.routes ++ oauth.routes
 

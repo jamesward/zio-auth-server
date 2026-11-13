@@ -25,6 +25,12 @@ object AuthServerSpec extends ZIOSpecDefault:
   private val cfg     = DevConfig.authServer(baseUrl)
   private val server  = AuthServer[TestUser](cfg, Pages.default[TestUser], Messages.default("Test"))
   private val routes  = server.routes
+  // A first-party client that skips the consent page, and `mcp` a scope clients may ask for.
+  private val trusted = AuthServer[TestUser](
+    cfg.copy(skipConsent = c => Set("test-client", "escalating-client").contains(c.id.value), clientScopes = Set(OAuthScope.of("mcp"))),
+    Pages.default[TestUser],
+    Messages.default("Test"),
+  ).routes
 
   private val clientId    = ClientId.of("test-client")
   private val redirectRaw = "http://127.0.0.1:9999/cb"
@@ -49,7 +55,7 @@ object AuthServerSpec extends ZIOSpecDefault:
 
   private given CanEqual[Status, Status] = CanEqual.derived
 
-  final case class TokenBody(access_token: String, refresh_token: Option[String]) derives JsonDecoder
+  final case class TokenBody(access_token: String, refresh_token: Option[String], scope: String) derives JsonDecoder
   final case class TokenError(error: String) derives JsonDecoder
 
   private type Env = InMemoryAuthStore.Stores[TestUser] & InMemoryAuthStore[TestUser] & Mailer & RecordingMailer & SecureRandomGen &
@@ -94,25 +100,47 @@ object AuthServerSpec extends ZIOSpecDefault:
                   .unless(cookies.contains(DevConfig.cookies.sessionName))
     yield cookies
 
-  private def authorize(cookies: Map[String, String]): ZIO[Env & Scope, Throwable, String] =
+  private def authorizeQuery(scope: String = "mcp", cid: ClientId = clientId): QueryParams =
+    QueryParams(
+      "response_type"         -> "code",
+      "client_id"             -> cid.value,
+      "redirect_uri"          -> redirectRaw,
+      "code_challenge"        -> challenge,
+      "code_challenge_method" -> "S256",
+      "scope"                 -> scope,
+      "state"                 -> "xyz",
+    )
+
+  private def registerClient(scopes: Set[OAuthScope] = Set(OAuthScope.of("mcp")), cid: ClientId = clientId): ZIO[Env, Throwable, Unit] =
+    Clock.instant.flatMap(now =>
+      ZIO.serviceWithZIO[AuthStore[TestUser]](_.createClient(client(now).copy(id = cid, scopes = scopes))).mapError(e => new AssertionError(e.toString))
+    )
+
+  /** The consent page's answer, as the user's browser would post it. */
+  private def decide(cookies: Map[String, String], q: QueryParams, decision: String, csrf: Option[String] = None) =
+    run(withCookies(
+      Request.post(url("/oauth/authorize"), form(
+        "_csrf"    -> csrf.getOrElse(cookies.getOrElse(DevConfig.cookies.csrfName, "")),
+        "request"  -> q.encode.stripPrefix("?"),
+        "decision" -> decision,
+      )),
+      cookies,
+    ))
+
+  private def codeIn(resp: Response): IO[AssertionError, String] =
+    ZIO
+      .fromOption(location(resp).flatMap(_.queryParams.queryParam("code")))
+      .orElseFail(new AssertionError(s"no code: ${resp.status} ${location(resp)}"))
+
+  /** Authorizes the test client for the signed-in user: the consent page, then Allow. */
+  private def authorize(cookies: Map[String, String], scope: String = "mcp"): ZIO[Env & Scope, Throwable, String] =
     for
-      now  <- Clock.instant
-      _    <- ZIO.serviceWithZIO[AuthStore[TestUser]](_.createClient(client(now))).mapError(e => new AssertionError(e.toString))
-      authz = url("/oauth/authorize").addQueryParams(
-                QueryParams(
-                  "response_type"         -> "code",
-                  "client_id"             -> clientId.value,
-                  "redirect_uri"          -> redirectRaw,
-                  "code_challenge"        -> challenge,
-                  "code_challenge_method" -> "S256",
-                  "scope"                 -> "mcp",
-                  "state"                 -> "xyz",
-                )
-              )
-      resp <- run(withCookies(Request.get(authz), cookies))
-      code <- ZIO
-                .fromOption(location(resp).flatMap(_.queryParams.queryParam("code")))
-                .orElseFail(new AssertionError(s"authorize: ${resp.status} ${location(resp)}"))
+      _       <- registerClient()
+      q        = authorizeQuery(scope)
+      consent <- run(withCookies(Request.get(url("/oauth/authorize").addQueryParams(q)), cookies))
+      _       <- ZIO.fail(new AssertionError(s"expected the consent page, got ${consent.status}")).unless(consent.status == (Status.Ok: Status))
+      allowed <- decide(cookies, q, "approve")
+      code    <- codeIn(allowed)
     yield code
 
   private def exchange(code: String): ZIO[Env & Scope, Nothing, Response] =
@@ -188,6 +216,76 @@ object AuthServerSpec extends ZIOSpecDefault:
         rt2 != rt1,
         replay.status == (Status.BadRequest: Status),
         afterRt2.status == (Status.BadRequest: Status),
+      )
+    },
+    test("a signed-in user gets the consent page, not a code: a link alone can't hand an attacker's client a code") {
+      for
+        cookies <- freshEmail.flatMap(signIn)
+        _       <- registerClient()
+        resp    <- run(withCookies(Request.get(url("/oauth/authorize").addQueryParams(authorizeQuery())), cookies))
+        body    <- resp.body.asString
+      yield assertTrue(
+        resp.status == (Status.Ok: Status),
+        location(resp).isEmpty,
+        body.contains("Allow access?"),
+        body.contains("127.0.0.1"),
+        resp.headers.get("X-Frame-Options").contains("DENY"),
+      )
+    },
+    test("the consent page escapes the client's own name") {
+      for
+        cookies <- freshEmail.flatMap(signIn)
+        now     <- Clock.instant
+        _       <- ZIO.serviceWithZIO[AuthStore[TestUser]](_.createClient(client(now).copy(name = "<script>alert(1)</script>")))
+                     .mapError(e => new AssertionError(e.toString))
+        body    <- run(withCookies(Request.get(url("/oauth/authorize").addQueryParams(authorizeQuery())), cookies)).flatMap(_.body.asString)
+      yield assertTrue(!body.contains("<script>alert(1)"), body.contains("&lt;script&gt;"))
+    },
+    test("the consent decision needs the session's csrf token, and Deny answers access_denied") {
+      for
+        cookies <- freshEmail.flatMap(signIn)
+        _       <- registerClient()
+        forged  <- decide(cookies, authorizeQuery(), "approve", csrf = Some("not-the-token"))
+        noUser  <- decide(Map.empty, authorizeQuery(), "approve", csrf = Some("x"))
+        denied  <- decide(cookies, authorizeQuery(), "deny")
+      yield assertTrue(
+        forged.status == (Status.Forbidden: Status),
+        noUser.status == (Status.Forbidden: Status),
+        location(denied).exists(_.queryParams.queryParam("error").contains("access_denied")),
+        location(denied).exists(_.queryParams.queryParam("code").isEmpty),
+      )
+    },
+    test("a client in skipConsent gets the code at once") {
+      for
+        cookies <- freshEmail.flatMap(signIn)
+        _       <- registerClient()
+        resp    <- trusted.runZIO(withCookies(Request.get(url("/oauth/authorize").addQueryParams(authorizeQuery())), cookies))
+        code    <- codeIn(resp)
+      yield assertTrue(code.nonEmpty)
+    },
+    test("a client that registered role:admin and asks for it gets only the user's own scopes and allowed client scopes") {
+      for
+        cookies <- freshEmail.flatMap(signIn)
+        escalating = ClientId.of("escalating-client")
+        _       <- registerClient(Set(OAuthScope.of("role:admin"), OAuthScope.of("mcp")), escalating)
+        // The default config: no client scopes, so only the user's own.
+        q        = authorizeQuery("role:admin mcp", escalating)
+        _       <- run(withCookies(Request.get(url("/oauth/authorize").addQueryParams(q)), cookies))
+        code    <- decide(cookies, q, "approve").flatMap(codeIn)
+        tokens  <- run(Request.post(url("/oauth/token"), form(
+                     "grant_type" -> "authorization_code", "code" -> code, "client_id" -> escalating.value,
+                     "redirect_uri" -> redirectRaw, "code_verifier" -> verifier,
+                   ))).flatMap(json[TokenBody])
+        // With `mcp` allowed for clients: that, plus the user's own, never role:admin.
+        direct  <- trusted.runZIO(withCookies(Request.get(url("/oauth/authorize").addQueryParams(q)), cookies))
+        code2   <- codeIn(direct)
+        tokens2 <- trusted.runZIO(Request.post(url("/oauth/token"), form(
+                     "grant_type" -> "authorization_code", "code" -> code2, "client_id" -> escalating.value,
+                     "redirect_uri" -> redirectRaw, "code_verifier" -> verifier,
+                   ))).flatMap(json[TokenBody])
+      yield assertTrue(
+        OAuthScopeSet.parse(tokens.scope) == Set(OAuthScope.of("role:user")),
+        OAuthScopeSet.parse(tokens2.scope) == Set(OAuthScope.of("role:user"), OAuthScope.of("mcp")),
       )
     },
     test("concurrent exchanges of one code: exactly one succeeds") {

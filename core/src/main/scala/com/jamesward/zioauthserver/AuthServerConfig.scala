@@ -58,6 +58,18 @@ final case class AuthServerConfig(
     /** Shorter than the magic link's: a 6-digit code is guessable, so it gets a smaller window. */
     otpTtl:               Duration       = 10.minutes,
     authorizationCodeTtl: Duration       = 60.seconds,
+    /**
+     * Scopes a client may ask for and get on top of the user's own ([[AccountView.scopes]]). Any other requested scope
+     * is dropped from the token, so a client can't ask its way to a role: a dynamically registered client may claim
+     * any `scope` (say `role:admin`). Default: none.
+     */
+    clientScopes:         Set[OAuthScope] = Set.empty,
+    /**
+     * Clients that get a code without the consent page (your own first-party clients). Dynamic Client Registration
+     * and CIMD let anyone create a client, so for them the signed-in user must approve each authorization, or a link
+     * to `/oauth/authorize` would hand the attacker's client a code for the user. Default: every client asks.
+     */
+    skipConsent:          OAuthClient => Boolean = _ => false,
 ):
   /** The issuer: the base URL without a trailing slash. */
   val issuer: String = baseUrl.encode.stripSuffix("/")

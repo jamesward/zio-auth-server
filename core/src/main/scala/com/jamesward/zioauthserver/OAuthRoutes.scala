@@ -11,7 +11,7 @@ import java.time.Instant
  * with replay detection, RFC 7662 introspection, RFC 7009 revocation, RFC 7591 dynamic client registration and Client
  * ID Metadata Documents.
  */
-final class OAuthRoutes[R, U: Tag](cfg: AuthServerConfig, gate: AuthorizeGate[R, U])(using AccountView[U]):
+final class OAuthRoutes[R, U: Tag](cfg: AuthServerConfig, gate: AuthorizeGate[R, U], pages: Pages[U])(using AccountView[U]):
 
   /** `Client` dereferences CIMD (Client ID Metadata Document) client_ids. */
   type Env = AuthStore[U] & SecureRandomGen & JwtSigner & Client & R
@@ -21,6 +21,7 @@ final class OAuthRoutes[R, U: Tag](cfg: AuthServerConfig, gate: AuthorizeGate[R,
       Method.GET / ".well-known" / "oauth-authorization-server" -> handler(metadata),
       Method.GET / "oauth" / "jwks"                             -> handler(jwks),
       Method.GET / "oauth" / "authorize"                        -> handler(authorize),
+      Method.POST / "oauth" / "authorize"                       -> handler(authorizeDecision),
       Method.POST / "oauth" / "token"                           -> handler(tokenEndpoint),
       Method.POST / "oauth" / "introspect"                      -> handler(introspect),
       Method.POST / "oauth" / "revoke"                          -> handler(revoke),
@@ -54,13 +55,14 @@ final class OAuthRoutes[R, U: Tag](cfg: AuthServerConfig, gate: AuthorizeGate[R,
     case InvalidRequest(d: String) extends AuthError("invalid_request", d)
     case UnsupportedResponseType   extends AuthError("unsupported_response_type", "only response_type=code is supported")
     case InvalidScope(d: String)   extends AuthError("invalid_scope", d)
+    case AccessDenied              extends AuthError("access_denied", "the user denied the request")
     case ServerError(d: String)    extends AuthError("server_error", d)
 
   private def authorize(req: Request): URIO[Env, Response] =
     parseRedirectUri(req.url.queryParams) match
       case Left(err) => ZIO.succeed(badRequest(err.message))
       case Right(_)  =>
-        authorizeKnownOAuthClient(req).merge.catchAllCause(c =>
+        authorizeKnownOAuthClient(req, req.url.queryParams, approved = false).merge.catchAllCause(c =>
           ZIO.logErrorCause("authorize crashed", c).as(Response.status(Status.InternalServerError))
         )
 
@@ -71,8 +73,37 @@ final class OAuthRoutes[R, U: Tag](cfg: AuthServerConfig, gate: AuthorizeGate[R,
       ru    <- RedirectUri.parse(ruRaw).left.map(e => PreRedirectError.BadRedirectUri(e.toString))
     yield (ClientId.of(cid), ru)
 
-  private def authorizeKnownOAuthClient(req: Request): ZIO[Env, Response, Response] =
-    val q           = req.url.queryParams
+  /**
+   * The consent page's answer. The original authorize query comes back in `request`; it is validated again exactly as
+   * on the GET, and the form's csrf token must match the session.
+   */
+  private def authorizeDecision(req: Request): URIO[Env, Response] =
+    val effect =
+      for
+        form     <- req.body.asURLEncodedForm.orElseFail(badRequest("bad form"))
+        field     = (n: String) => form.get(n).flatMap(_.stringValue).getOrElse("")
+        q         = QueryParams.decode(field("request"))
+        current  <- Sessions.current[U](cfg, req).orElseFail(Response.status(Status.InternalServerError))
+        session  <- ZIO.fromOption(current.map(_._1)).orElseFail(Response.status(Status.Forbidden))
+        _        <- ZIO.unless(Csrf.isValid(cfg, field("_csrf"), session))(ZIO.fail(Response.status(Status.Forbidden)))
+        // The gate and the login bounce see the request as the GET it stands for.
+        asGet     = req.copy(method = Method.GET, url = req.url.copy(queryParams = q))
+        response <- field("decision") match
+                      case "approve" => authorizeKnownOAuthClient(asGet, q, approved = true)
+                      case "deny"    =>
+                        parseRedirectUri(q) match
+                          case Left(err)     => ZIO.succeed(badRequest(err.message))
+                          case Right((cid, ru)) =>
+                            resolveClient(cid).orElseFail(Response.status(Status.InternalServerError)).map {
+                              case Some(c) if ru.matchesRegistered(c.redirectUris) =>
+                                redirectWithError(ru, AuthError.AccessDenied, q.queryParam("state"))
+                              case _                                                => badRequest("unknown client or redirect_uri")
+                            }
+                      case _         => ZIO.succeed(badRequest("decision must be approve or deny"))
+      yield response
+    effect.merge.catchAllCause(c => ZIO.logErrorCause("authorize decision crashed", c).as(Response.status(Status.InternalServerError)))
+
+  private def authorizeKnownOAuthClient(req: Request, q: QueryParams, approved: Boolean): ZIO[Env, Response, Response] =
     val internalErr = (_: Any) => Response.status(Status.InternalServerError)
     for
       cid       <- ZIO
@@ -88,7 +119,7 @@ final class OAuthRoutes[R, U: Tag](cfg: AuthServerConfig, gate: AuthorizeGate[R,
       _         <- ZIO.unless(ru.matchesRegistered(client.redirectUris))(
                      ZIO.fail(badRequest(PreRedirectError.RedirectUriNotRegistered.message))
                    )
-      result    <- validateAndIssue(client, ru, q, req)
+      result    <- validateAndIssue(client, ru, q, req, approved)
     yield result
 
   // --- Client resolution: pre-registered / DCR client, or CIMD dereference ---
@@ -172,9 +203,10 @@ final class OAuthRoutes[R, U: Tag](cfg: AuthServerConfig, gate: AuthorizeGate[R,
 
   private def validateAndIssue(
       client: OAuthClient,
-      ru:     RedirectUri,
-      q:      QueryParams,
-      req:    Request,
+      ru:       RedirectUri,
+      q:        QueryParams,
+      req:      Request,
+      approved: Boolean,
   ): ZIO[Env, Response, Response] =
     val internalErr = (_: Any) => Response.status(Status.InternalServerError)
     val state       = q.queryParam("state")
@@ -190,10 +222,13 @@ final class OAuthRoutes[R, U: Tag](cfg: AuthServerConfig, gate: AuthorizeGate[R,
       method       <- ZIO
                         .fromEither(ChallengeMethod.parse(methodRaw))
                         .mapError(e => redirectErr(AuthError.InvalidRequest(s"bad code_challenge_method: $e")))
-      scopeReq      = q.queryParam("scope").map(OAuthScopeSet.parse).getOrElse(Set.empty)
-      _            <- ZIO.unless(scopeReq.subsetOf(client.scopes))(
+      requested     = q.queryParam("scope").map(OAuthScopeSet.parse).getOrElse(Set.empty)
+      _            <- ZIO.unless(requested.subsetOf(client.scopes))(
                         ZIO.fail(redirectErr(AuthError.InvalidScope("requested scope not allowed for client")))
                       )
+      // Only scopes the server lets clients have: a client that registered `role:admin` doesn't get it. The user's own
+      // scopes are added at the exchange.
+      scopeReq      = requested.filter(cfg.clientScopes)
       resource     <- q.queryParam("resource") match
                         case None    => ZIO.succeed(Option.empty[ResourceIndicator])
                         case Some(s) =>
@@ -213,6 +248,8 @@ final class OAuthRoutes[R, U: Tag](cfg: AuthServerConfig, gate: AuthorizeGate[R,
                             challengeRaw,
                             method,
                             state,
+                            consented = approved || cfg.skipConsent(client),
+                            consentPage = consentPage(user, client, ru, scopeReq, q, req),
                           )
                             .tapErrorCause(c => ZIO.logErrorCause("validateAndIssue: gateOrIssue failed", c))
                             .mapError(internalErr)
@@ -224,12 +261,27 @@ final class OAuthRoutes[R, U: Tag](cfg: AuthServerConfig, gate: AuthorizeGate[R,
       challengeRaw: String,
       method:       ChallengeMethod,
       state:        Option[String],
+      consented:    Boolean,
+      consentPage:  => Response,
   ): RIO[Env, Response] =
     gate.check(ctx).flatMap {
+      case GateDecision.Allow if !consented => ZIO.succeed(consentPage)
       case GateDecision.Allow             =>
         issueGrantAndRedirect(ctx.client, ctx.user, ru, ctx.scopes, ctx.resource, CodeChallenge.of(challengeRaw), method, state)
       case GateDecision.Respond(response) => ZIO.succeed(response)
     }
+
+  /** The consent page: not framable, not cached, and with the session's csrf token in its form. */
+  private def consentPage(user: U, client: OAuthClient, ru: RedirectUri, scopes: Set[OAuthScope], q: QueryParams, req: Request): Response =
+    Sessions.readCookie(req, cfg.cookies.csrfName) match
+      case None       => redirectToLogin(req)
+      case Some(csrf) =>
+        val host = scala.util.Try(java.net.URI.create(ru.value)).toOption.flatMap(u => Option(u.getHost)).getOrElse(ru.value)
+        Response
+          .html(pages.consent(user, ConsentRequest(client.name, client.id, host, scopes, q.encode.stripPrefix("?")), CsrfToken.fromBase64Url(csrf)))
+          .addHeader(Header.CacheControl.NoStore)
+          .addHeader("X-Frame-Options", "DENY")
+          .addHeader("Content-Security-Policy", "frame-ancestors 'none'")
 
   private def issueGrantAndRedirect(
       client:    OAuthClient,
@@ -405,7 +457,7 @@ final class OAuthRoutes[R, U: Tag](cfg: AuthServerConfig, gate: AuthorizeGate[R,
 
       // The user's own scopes (toolbook's role closure) go alongside the requested scopes, so the JWT carries enough
       // for resource-server `requireScopes(role:X)` checks.
-      effectiveScopes = consumed.scopes ++ consumed.userScopes
+      effectiveScopes = consumed.scopes.filter(cfg.clientScopes) ++ consumed.userScopes
 
       claims = accessTokenClaims(consumed.userId, effectiveScopes, client.id, consumed.resource, now, expiresAt, jti)
       tokStr <- ZIO.serviceWithZIO[JwtSigner](_.sign(claims))
@@ -873,3 +925,11 @@ final class OAuthRoutes[R, U: Tag](cfg: AuthServerConfig, gate: AuthorizeGate[R,
 
   private def badRequest(msg: String): Response =
     Response.status(Status.BadRequest).copy(body = Body.fromString(msg))
+
+object OAuthRoutes:
+  /** With the default consent page ([[Pages.defaultConsent]]). */
+  def apply[R, U: Tag](cfg: AuthServerConfig, gate: AuthorizeGate[R, U])(using AccountView[U]): OAuthRoutes[R, U] =
+    new OAuthRoutes(cfg, gate, Pages.default[U])
+
+  def apply[R, U: Tag](cfg: AuthServerConfig, gate: AuthorizeGate[R, U], pages: Pages[U])(using AccountView[U]): OAuthRoutes[R, U] =
+    new OAuthRoutes(cfg, gate, pages)

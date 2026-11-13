@@ -92,7 +92,7 @@ object OAuthConnectorSpec extends ZIOSpecDefault:
         c       = connector(p)
         url    <- c.start(owner, Some("/settings")).mapError(e => new AssertionError(e.toString))
         q       = url.queryParams
-        result <- c.callback("the-code", q.queryParam("state").get).mapError(e => new AssertionError(e.toString))
+        result <- c.callback("the-code", q.queryParam("state").get, owner).mapError(e => new AssertionError(e.toString))
         stored <- ZIO.serviceWithZIO[ConnectionStore](_.findConnection(owner, "github"))
         token  <- c.accessToken(owner).mapError(e => new AssertionError(e.toString))
       yield assertTrue(
@@ -105,14 +105,26 @@ object OAuthConnectorSpec extends ZIOSpecDefault:
         token.startsWith("access-"),
       )
     },
+    test("a callback in another user's browser is refused: an attacker can't connect a victim's account to themselves") {
+      for
+        p       <- ZIO.service[Provider]
+        _       <- seedOwner
+        _       <- ZIO.serviceWithZIO[ConnectionStore](_.deleteConnection(owner, "github"))
+        c        = connector(p)
+        state   <- startFlow(c) // started by `owner`, whose link is opened by someone else
+        victim   = UserId.fresh(java.util.UUID.randomUUID())
+        res     <- c.callback("code", state, victim).either
+        none    <- ZIO.serviceWithZIO[ConnectionStore](_.findConnection(owner, "github"))
+      yield assertTrue(res == Left(ConnectError.InvalidState), none.isEmpty)
+    },
     test("a state works once") {
       for
         p      <- ZIO.service[Provider]
         _      <- seedOwner
         c       = connector(p)
         state  <- startFlow(c)
-        first  <- c.callback("code", state).either
-        second <- c.callback("code", state).either
+        first  <- c.callback("code", state, owner).either
+        second <- c.callback("code", state, owner).either
       yield assertTrue(first.isRight, second == Left(ConnectError.InvalidState))
     },
     test("an account other than the allowed one is refused and not stored") {
@@ -123,7 +135,7 @@ object OAuthConnectorSpec extends ZIOSpecDefault:
         _     <- p.subject.set("999")
         c      = connector(p)
         state <- startFlow(c)
-        res   <- c.callback("code", state).either
+        res   <- c.callback("code", state, owner).either
         _     <- p.subject.set("42")
         none  <- ZIO.serviceWithZIO[ConnectionStore](_.findConnection(owner, "github"))
       yield assertTrue(res == Left(ConnectError.SubjectNotAllowed("999")), none.isEmpty)
@@ -135,7 +147,7 @@ object OAuthConnectorSpec extends ZIOSpecDefault:
         _       <- p.expiresIn.set(30) // inside the one-minute margin, so every use refreshes
         c        = connector(p)
         state   <- startFlow(c)
-        _       <- c.callback("code", state).mapError(e => new AssertionError(e.toString))
+        _       <- c.callback("code", state, owner).mapError(e => new AssertionError(e.toString))
         before  <- p.issued.get
         token   <- c.accessToken(owner).mapError(e => new AssertionError(e.toString))
         after   <- p.issued.get
@@ -150,7 +162,7 @@ object OAuthConnectorSpec extends ZIOSpecDefault:
         _       <- seedOwner
         c        = connector(p)
         state   <- startFlow(c)
-        _       <- c.callback("code", state).mapError(e => new AssertionError(e.toString))
+        _       <- c.callback("code", state, owner).mapError(e => new AssertionError(e.toString))
         removed <- c.disconnect(owner).mapError(e => new AssertionError(e.toString))
         token   <- c.accessToken(owner).either
       yield assertTrue(removed, token == Left(ConnectError.NotConnected))

@@ -87,12 +87,17 @@ final class OAuthConnector(
       base     <- ZIO.fromEither(URL.decode(provider.authorizeUrl)).orElseFail(ConnectError.Internal("bad authorizeUrl"))
     yield base.addQueryParams(params)
 
-  /** Finishes the flow at the redirect URI: exchanges the code, checks the account, stores the connection. */
-  def callback(code: String, state: String): ZIO[ConnectionStore & Client, ConnectError, (Connection, Option[String])] =
+  /**
+   * Finishes the flow at the redirect URI: exchanges the code, checks the account, stores the connection.
+   * `signedIn` is the user signed in to the browser that came back: it must be the user who started the flow, or an
+   * attacker could start a flow for their own user and send the authorize link to a victim, whose provider account
+   * would then be connected to the attacker's user.
+   */
+  def callback(code: String, state: String, signedIn: UserId): ZIO[ConnectionStore & Client, ConnectError, (Connection, Option[String])] =
     for
       now     <- Clock.instant
       taken   <- ZIO.serviceWithZIO[ConnectionStore](_.takeConnectionState(hashState(state), now)).mapError(internal)
-      pending <- ZIO.fromOption(taken.filter(_.provider == provider.name)).orElseFail(ConnectError.InvalidState)
+      pending <- ZIO.fromOption(taken.filter(t => t.provider == provider.name && t.userId == signedIn)).orElseFail(ConnectError.InvalidState)
       tokens  <- tokenRequest(
                    "grant_type"    -> "authorization_code",
                    "code"          -> code,
@@ -262,19 +267,32 @@ object GitHub:
     yield ()
 
 /**
- * The provider's redirect URI: `GET /connect/<provider>/callback`. On success it redirects to the flow's `returnTo`
- * (when [[AuthServerConfig.safeReturnTo]] allows it) or answers a short page.
+ * The provider's redirect URI: `GET /connect/<provider>/callback`. It needs the session of the user who started the
+ * flow. On success it redirects to the flow's `returnTo` (when [[AuthServerConfig.safeReturnTo]] allows it) or
+ * answers a short page.
  */
-final class ConnectionRoutes(cfg: AuthServerConfig, connector: OAuthConnector, providerName: String):
+final class ConnectionRoutes[U: Tag](cfg: AuthServerConfig, connector: OAuthConnector, providerName: String)(using view: AccountView[U]):
 
-  val routes: Routes[ConnectionStore & Client, Response] =
+  type Env = AuthStore[U] & ConnectionStore & Client
+
+  val routes: Routes[Env, Response] =
     Routes(Method.GET / "connect" / providerName / "callback" -> handler(callback))
 
-  private def callback(req: Request): URIO[ConnectionStore & Client, Response] =
+  private def callback(req: Request): URIO[Env, Response] =
     val q = req.url.queryParams
     (q.queryParam("code"), q.queryParam("state")) match
       case (Some(code), Some(state)) =>
-        connector.callback(code, state).either.flatMap {
+        Sessions.current[U](cfg, req).either.flatMap {
+          case Left(t)             => ZIO.logErrorCause("connection callback: session lookup failed", Cause.fail(t)).as(Response.status(Status.InternalServerError))
+          case Right(None)         => ZIO.succeed(Response.text(s"Sign in first, then connect $providerName again.").status(Status.Unauthorized))
+          case Right(Some((_, u))) => finish(code, state, view.id(u))
+        }
+      case _                         =>
+        // The provider sends `error` when the user declined.
+        ZIO.succeed(Response.text(s"$providerName connection not completed: ${q.queryParam("error").getOrElse("missing code")}").status(Status.BadRequest))
+
+  private def finish(code: String, state: String, signedIn: UserId): URIO[Env, Response] =
+        connector.callback(code, state, signedIn).either.flatMap {
           case Right((_, returnTo)) =>
             ZIO.succeed(returnTo.flatMap(cfg.safeReturnTo) match
               case Some(target) => Response.status(Status.SeeOther).addHeader(Header.Location(URL.decode(target).toOption.get))
@@ -282,9 +300,6 @@ final class ConnectionRoutes(cfg: AuthServerConfig, connector: OAuthConnector, p
           case Left(e)              =>
             ZIO.logWarning(s"$providerName connection failed: $e").as(Response.text(message(e)).status(Status.BadRequest))
         }
-      case _                         =>
-        // The provider sends `error` when the user declined.
-        ZIO.succeed(Response.text(s"$providerName connection not completed: ${q.queryParam("error").getOrElse("missing code")}").status(Status.BadRequest))
 
   private def message(e: ConnectError): String = e match
     case ConnectError.InvalidState         => "This connection link expired or was already used. Start again."
