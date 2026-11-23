@@ -1,7 +1,7 @@
 name := "zio-auth-server-magnum"
 
 val zioVersion    = "2.1.27"
-val flywayVersion = "13.12.2"
+val flywayVersion = "13.13.0"
 
 libraryDependencies ++= Seq(
   "dev.cheleb"       %% "zio-magnum"                 % "4.2.0",
