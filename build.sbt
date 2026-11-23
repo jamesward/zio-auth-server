@@ -1,7 +1,7 @@
 // Settings at the top of this file apply to every subproject (sbt 2).
 organization := "com.jamesward"
 
-scalaVersion := "3.9.0"
+scalaVersion := "3.10.1"
 
 scalacOptions ++= Seq(
   "-language:strictEquality",
